@@ -1,0 +1,17 @@
+Sanitize report
+===============
+
+Status: OK
+
+Changes made:
+- Removed the hardcoded Java API key fallback from MDragonsEconomy.java.
+- Moved bot.py Discord token, backend URL, role IDs, channel IDs, user IDs, emoji ID, and initial balances to environment variables.
+- Added lightweight .env loading to bot.py and app.py without requiring python-dotenv.
+- Added .env.example with placeholders only.
+- Added .gitignore to block .env, .env.* except .env.example, databases, Python caches, and Java build outputs.
+- app.py and bot.py compile successfully with py_compile.
+
+Scan results:
+- Original embedded Java API key: not found in sanitized output.
+- Known hardcoded Discord/user/channel IDs from the uploaded bot.py: not found in sanitized bot.py.
+- Long numeric IDs remaining: only placeholder 123456789012345678 in comments/examples.

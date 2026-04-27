@@ -1,0 +1,48 @@
+name: MDragonsEconomyPlugin
+version: 1.0
+main: com.mdragons.mdragonseconomyplugin.MDragonsEconomy
+api-version: 1.21
+
+commands:
+  discord:
+    description: Get your Discord verification code to link your account
+    usage: /discord
+
+  deposit:
+    description: Deposit any commodity item into your vault
+    usage: /deposit <item> <amount|all> or /deposit inv
+    # Accepts Minecraft item names (iron_ingot, oak_log, red_wool, diamond_block...) and xp.
+    # Blocks are converted into item units where reversible, e.g. 1 iron_block = 9 iron ingots.
+
+  withdraw:
+    description: Withdraw any commodity from your vault
+    usage: /withdraw <item> <amount> [variant]
+    # For colorable/wood commodities specify a variant:
+    #   /withdraw overworld_log 10 oak
+    #   /withdraw wool 16 red
+    #   /withdraw concrete 8 light_blue
+
+  balance:
+    description: View your full vault balance across all commodities
+    usage: /balance [item]
+
+  itemgui:
+    description: Open a GUI for one vault item balance
+    usage: /itemgui <item>
+    aliases: [itembalance]
+
+  alive:
+    description: Show the Minecraft-days-alive leaderboard
+    usage: /alive [page]
+
+  bounty:
+    description: Place a dragon bounty on a player
+    usage: /bounty <playername> <dragons>
+    aliases: [bouny]
+
+  helpmc:
+    description: Show item name help and categories for deposit/withdraw
+    usage: /helpmc [category]
+    # Categories: ores, wood, farming, mob, blocks, nether, end, color, misc
+    # Example: /helpmc wood   -> shows all wood variants
+    #          /helpmc color  -> shows wool/concrete colors
