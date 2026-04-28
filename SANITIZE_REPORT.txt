@@ -1,33 +1,12 @@
-# Sanitization Report
+MDragonsEconomy.java security update
 
-## Summary
+Changes made:
+- Removed the hardcoded API key fallback from API_KEY.
+- Added a startup fail-fast check: the plugin disables itself if API_KEY is not set.
+- Kept BACKEND_URL environment override behavior unchanged.
+- Left gameplay/economy behavior unchanged.
 
-This update keeps existing economy behavior intact while removing publish blockers and making public configuration explicit.
-
-## Code changes made
-
-- Removed the hardcoded Java plugin API key fallback.
-- Added a startup warning in the Java plugin when `API_KEY` is missing.
-- Changed the FastAPI backend so it refuses to start without `API_KEY`.
-- Changed backend API-key middleware to protect every `/api/...` route except `/api/health`.
-- Uses constant-time `secrets.compare_digest` for backend API-key comparison.
-- Changed the Discord bot so `BACKEND_URL` is configurable from the environment.
-- Changed the Discord bot so it refuses to start without `DISCORD_TOKEN` and `API_KEY`.
-- Moved Discord role IDs, channel IDs, privileged user IDs, relay bot IDs, DAEMON emoji, and initial DAEMON seed balances to environment variables.
-- Added `.env.example`.
-- Added `.gitignore`.
-- Rewrote `README.md` as a cleaner public/operator guide.
-
-## Validation run
-
-- `py_compile` passed for `app.py`.
-- `py_compile` passed for `bot.py`.
-- Secret-style scan found no hardcoded 50+ character token-like strings in the update folder.
-- Discord-ID scan found no hardcoded 17+ digit IDs in the update folder.
-
-## Notes
-
-- `Daemon Whitepaper.pdf` was not edited.
-- `plugin.yml` was not changed except being included in the package.
-- Java compilation was not run here because the Paper/Spigot API jar was not present in the uploaded files.
-- A raw unified diff was intentionally not included because diffs can repeat removed secrets/IDs from the original source.
+Validation:
+- Hardcoded long token-like string literals found: 0
+- Hardcoded 17+ digit IDs found: 0
+- Java compilation was not run because Paper/Spigot API dependencies were not provided.

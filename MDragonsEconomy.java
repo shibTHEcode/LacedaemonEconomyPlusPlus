@@ -88,9 +88,7 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         DEF_OUT.put("lapis", Material.LAPIS_LAZULI);
 
         // ── Netherite — order-book item, routed to legacy endpoint ────────────
-        // Scrap is handled specially: requires multiples of 4, converts to ingots
         reg(Material.NETHERITE_INGOT, "netherite", 1.0);
-        reg(Material.NETHERITE_SCRAP, "netherite", 0.25); // special path in deposit
         DEF_OUT.put("netherite", Material.NETHERITE_INGOT);
 
         // ── Stone (each separate, 1:1) ────────────────────────────────────────
@@ -269,7 +267,6 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         ALIASES.put("lapis",           Material.LAPIS_LAZULI);
         ALIASES.put("lapis_lazuli",    Material.LAPIS_LAZULI);
         ALIASES.put("netherite",       Material.NETHERITE_INGOT);
-        ALIASES.put("scrap",           Material.NETHERITE_SCRAP);
         ALIASES.put("log",             Material.OAK_LOG);
         ALIASES.put("wood",            Material.OAK_LOG);
         ALIASES.put("stem",            Material.CRIMSON_STEM);
@@ -300,12 +297,14 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        if (API_KEY.isEmpty()) {
+            getLogger().severe("API_KEY environment variable is required. Disabling MDragonsEconomy to avoid unauthenticated backend access.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getScheduler().runTaskTimer(this, this::reportAlivePlayers, 20L * 60L, 20L * 60L);
-        getLogger().info("MDragonsEconomy loaded. Backend: " + BACKEND_URL + (API_KEY.isEmpty() ? " (no API key)" : " (API key configured)"));
-        if (API_KEY.isEmpty()) {
-            getLogger().severe("API_KEY is not set. Backend requests will be rejected by a secured backend.");
-        }
+        getLogger().info("MDragonsEconomy loaded. Backend: " + BACKEND_URL + " (API key configured)");
     }
 
     @EventHandler
@@ -595,34 +594,6 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
     }
 
     private void depositLegacy(Player player, Material mat, int amount, CEntry entry) {
-        // Special: netherite scrap converts 4:1 to ingots
-        if (mat == Material.NETHERITE_SCRAP) {
-            int ingots = amount / 4;
-            int remainder = amount % 4;
-            if (ingots == 0) {
-                player.sendMessage("§cYou need at least §e4 scraps§c to deposit (you have §e" + amount + "§c). They convert at 4:1.");
-                return;
-            }
-            int toTake = ingots * 4;
-            removeItems(player, mat, toTake);
-            if (remainder > 0)
-                player.sendMessage("§e" + remainder + "§7 scrap(s) returned — need 4 per ingot.");
-            int finalIngots = ingots;
-            getServer().getScheduler().runTaskAsynchronously(this, () -> {
-                boolean ok = legacyPost("deposit", player.getUniqueId(), "NETHERITE_INGOT", finalIngots);
-                if (ok) logDepositWithdraw(player.getUniqueId(), "deposit", "NETHERITE_INGOT", finalIngots, finalIngots);
-                getServer().getScheduler().runTask(this, () -> {
-                    if (ok) {
-                        player.sendMessage("§aDeposited §e" + finalIngots + "§a netherite ingot(s) (converted from §e" + toTake + "§a scraps).");
-                    } else {
-                        player.sendMessage("§cDeposit failed — returning scraps.");
-                        player.getInventory().addItem(new ItemStack(mat, toTake));
-                    }
-                });
-            });
-            return;
-        }
-
         // Diamond or netherite ingot (including diamond block → 9 per block)
         int baseAmount = (int)(amount * entry.ratio());
         if (baseAmount <= 0) {
@@ -983,7 +954,7 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
                     player.sendMessage("  §femerald§7 → emerald_block §8(base), emerald §8(1/9)");
                     player.sendMessage("  §fredstone§7 → redstone §8(base), redstone_block §8(9 dust)");
                     player.sendMessage("  §flapis§7 → lapis_lazuli §8(base), lapis_block §8(9 lapis)");
-                    player.sendMessage("  §fnetherite§7 → netherite_ingot, netherite_scrap §8(4 scraps = 1 ingot)");
+                    player.sendMessage("  §fnetherite§7 → netherite_ingot");
                 }
                 case "wood" -> {
                     player.sendMessage("§6§lWood §7— use commodity name + variant:");
