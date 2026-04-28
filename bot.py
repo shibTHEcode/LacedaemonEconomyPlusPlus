@@ -17,136 +17,156 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 import logging
 
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# CONFIG â€” Economy bot
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be set before starting the Discord bot.")
+    return value
 
-def _env_int(name: str, default: int = 0) -> int:
-    """Read an integer environment variable.
 
-    Defaults to 0 so public copies do not grant permissions or target private
-    channels until the operator explicitly configures IDs.
-    """
+def env_int(name: str, default: int = 0) -> int:
     raw = os.environ.get(name, "").strip()
-    if raw == "":
+    if not raw:
         return default
     try:
         return int(raw)
     except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer") from exc
+        raise RuntimeError(f"{name} must be an integer Discord ID.") from exc
 
 
-def _env_int_set(name: str) -> set[int]:
-    raw = os.environ.get(name, "").strip()
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
     if not raw:
-        return set()
-    result: set[int] = set()
-    for part in raw.split(","):
-        value = part.strip()
-        if not value:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def parse_int_set_env(name: str) -> set[int]:
+    values: set[int] = set()
+    for part in os.environ.get(name, "").split(","):
+        part = part.strip()
+        if not part:
             continue
-        try:
-            result.add(int(value))
-        except ValueError as exc:
-            raise RuntimeError(f"{name} must contain comma-separated integer IDs") from exc
-    return result
+        if not part.isdigit():
+            raise RuntimeError(f"{name} must be a comma-separated list of integer IDs.")
+        values.add(int(part))
+    return values
 
 
-def _env_initial_balances() -> dict[int, int]:
-    """Read optional DAEMON seed balances from JSON.
+def parse_int_list_env(name: str) -> list[int]:
+    return sorted(parse_int_set_env(name))
 
-    Example:
-      DAEMON_INITIAL_BALANCES='{"123": 7200}'
+
+def parse_initial_balances() -> dict[int, int]:
+    """
+    Load public-safe seed balances from DAEMON_INITIAL_BALANCES.
+
+    Supported formats:
+      JSON: {"1234567890": 1000, "2345678901": 500}
+      CSV:  1234567890:1000,2345678901:500
+
+    The default is empty so real Discord user IDs and balances are not committed.
     """
     raw = os.environ.get("DAEMON_INITIAL_BALANCES", "").strip()
     if not raw:
         return {}
+
     try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("expected a JSON object")
+        if raw.startswith("{"):
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                raise ValueError("JSON value must be an object")
+            return {int(user_id): int(balance) for user_id, balance in loaded.items() if int(balance) > 0}
+
         balances: dict[int, int] = {}
-        for user_id, amount in data.items():
-            parsed_amount = int(amount)
-            if parsed_amount > 0:
-                balances[int(user_id)] = parsed_amount
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            user_id, balance = entry.split(":", 1)
+            amount = int(balance.strip())
+            if amount > 0:
+                balances[int(user_id.strip())] = amount
         return balances
     except Exception as exc:
-        raise RuntimeError("DAEMON_INITIAL_BALANCES must be a JSON object of Discord user IDs to positive integer balances") from exc
+        raise RuntimeError(
+            "DAEMON_INITIAL_BALANCES must be JSON like {\"123\": 1000} or CSV like 123:1000,456:500."
+        ) from exc
 
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIG — Economy bot
-# ─────────────────────────────────────────────────────────────────
-TOKEN    = os.environ.get("DISCORD_TOKEN")
-BASE_URL = os.environ.get("BACKEND_URL", "http://mdragons-backend:8000/api").rstrip("/")
-API_KEY = os.environ.get("API_KEY", "").strip()
-API_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+# Runtime secrets and backend config
+TOKEN = required_env("DISCORD_TOKEN")
+BASE_URL = os.environ.get("BACKEND_URL", "http://mdragons-backend:8000/api").strip().rstrip("/")
+API_KEY = required_env("API_KEY")
+API_HEADERS = {"X-API-Key": API_KEY}
 
-# ─── Role IDs ─────────────────────────────────────────────────────
-CASHOUT_ROLE_ID            = _env_int("CASHOUT_ROLE_ID")
-MDRAGONS_ROLE_ID           = _env_int("MDRAGONS_ROLE_ID")
-TEN_MDRAGONS_ROLE_ID       = _env_int("TEN_MDRAGONS_ROLE_ID")
-TEN_CASHOUT_ROLE_ID        = _env_int("TEN_CASHOUT_ROLE_ID")
-CHAIRMAN_ROLE_ID           = _env_int("CHAIRMAN_ROLE_ID")
-MANSA_MUSA_ROLE_ID         = _env_int("MANSA_MUSA_ROLE_ID")
-NETHERITE_OVERLORD_ROLE_ID = _env_int("NETHERITE_OVERLORD_ROLE_ID")
-SATOSHI_NAKAMOTO_ROLE_ID   = _env_int("SATOSHI_NAKAMOTO_ROLE_ID")
+# Role IDs — configure these in your deployment environment, not in source.
+CASHOUT_ROLE_ID            = env_int("CASHOUT_ROLE_ID")
+MDRAGONS_ROLE_ID           = env_int("MDRAGONS_ROLE_ID")
+TEN_MDRAGONS_ROLE_ID       = env_int("TEN_MDRAGONS_ROLE_ID")
+TEN_CASHOUT_ROLE_ID        = env_int("TEN_CASHOUT_ROLE_ID")
+CHAIRMAN_ROLE_ID           = env_int("CHAIRMAN_ROLE_ID")
+MANSA_MUSA_ROLE_ID         = env_int("MANSA_MUSA_ROLE_ID")
+NETHERITE_OVERLORD_ROLE_ID = env_int("NETHERITE_OVERLORD_ROLE_ID")
+SATOSHI_NAKAMOTO_ROLE_ID   = env_int("SATOSHI_NAKAMOTO_ROLE_ID")
 
-# ─── Channel IDs ──────────────────────────────────────────────────
-ANNOUNCEMENT_CHANNEL_ID    = _env_int("ANNOUNCEMENT_CHANNEL_ID")
-TRANSACTION_LOG_CHANNEL_ID = _env_int("TRANSACTION_LOG_CHANNEL_ID")
-DEPOSIT_LOG_CHANNEL_ID     = _env_int("DEPOSIT_LOG_CHANNEL_ID")
-TRADE_LOG_CHANNEL_ID       = _env_int("TRADE_LOG_CHANNEL_ID")
-EXTERNAL_ECONOMY_LOG_ID    = _env_int("EXTERNAL_ECONOMY_LOG_ID")
-UNBELIEVABOAT_BOT_ID       = _env_int("UNBELIEVABOAT_BOT_ID")
-EXTERNAL_ECONOMY_BOT_ID    = _env_int("EXTERNAL_ECONOMY_BOT_ID")
-EXTERNAL_ECONOMY_SCANNER   = _env_int("EXTERNAL_ECONOMY_SCANNER")
-COMMIT_LOG_CHANNEL_ID      = _env_int("COMMIT_LOG_CHANNEL_ID")
+# Channel and bot/user IDs — configure these in your deployment environment.
+ANNOUNCEMENT_CHANNEL_ID    = env_int("ANNOUNCEMENT_CHANNEL_ID")
+TRANSACTION_LOG_CHANNEL_ID = env_int("TRANSACTION_LOG_CHANNEL_ID")
+DEPOSIT_LOG_CHANNEL_ID     = env_int("DEPOSIT_LOG_CHANNEL_ID")
+TRADE_LOG_CHANNEL_ID       = env_int("TRADE_LOG_CHANNEL_ID")
+EXTERNAL_ECONOMY_LOG_ID    = env_int("EXTERNAL_ECONOMY_LOG_ID")
+UNBELIEVABOAT_BOT_ID       = env_int("UNBELIEVABOAT_BOT_ID")
+EXTERNAL_ECONOMY_BOT_ID    = env_int("EXTERNAL_ECONOMY_BOT_ID")
+EXTERNAL_ECONOMY_SCANNER   = env_int("EXTERNAL_ECONOMY_SCANNER")
+COMMIT_LOG_CHANNEL_ID      = env_int("COMMIT_LOG_CHANNEL_ID")
+PAUSE_INJECTION_USER_ID    = env_int("PAUSE_INJECTION_USER_ID")
 
-# ─── Special permissions ──────────────────────────────────────────
-PAUSE_INJECTION_USER_ID = _env_int("PAUSE_INJECTION_USER_ID")
+# Thresholds & rewards
+CASHOUT_THRESHOLD_1 = int(os.environ.get("CASHOUT_THRESHOLD_1", "35000"))
+CASHOUT_THRESHOLD_2 = int(os.environ.get("CASHOUT_THRESHOLD_2", "350000"))
+MDRAGONS_REWARD     = int(os.environ.get("MDRAGONS_REWARD", "35000"))
+TEN_MDRAGONS_REWARD = int(os.environ.get("TEN_MDRAGONS_REWARD", "350000"))
+CASHOUT_COOLDOWN    = int(os.environ.get("CASHOUT_COOLDOWN", "60"))
 
-# ─── Thresholds & rewards ─────────────────────────────────────────
-CASHOUT_THRESHOLD_1 = 35_000
-CASHOUT_THRESHOLD_2 = 350_000
-MDRAGONS_REWARD     = 35_000
-TEN_MDRAGONS_REWARD = 350_000
-CASHOUT_COOLDOWN    = 60  # seconds
-
-# ─── Colour palette ───────────────────────────────────────────────
+# Colour palette
 BLUE  = 0x1E90FF
 GREEN = 0x00C853
 RED   = 0xE53935
 
-# ─── Per-user cashout cooldown tracker ───────────────────────────
 _cashout_cooldowns: dict[int, float] = {}
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIG — Daemon bot
-# ─────────────────────────────────────────────────────────────────
+# Daemon bot config
 DAEMON_EMOJI        = os.environ.get("DAEMON_EMOJI", "DAEMON")
-TRANSACTION_CHANNEL = _env_int("DAEMON_TRANSACTION_CHANNEL_ID")
-ARENA_CHANNEL       = _env_int("ARENA_CHANNEL_ID")
-ADMIN_USER_ID       = _env_int("ADMIN_USER_ID")
-GAMEFIX_USER_ID     = _env_int("GAMEFIX_USER_ID")
+TRANSACTION_CHANNEL = env_int("DAEMON_TRANSACTION_CHANNEL_ID")
+ARENA_CHANNEL       = env_int("ARENA_CHANNEL_ID")
+ADMIN_USER_ID       = env_int("ADMIN_USER_ID")
+GAMEFIX_USER_ID     = env_int("GAMEFIX_USER_ID")
 
-MAX_SUPPLY         = 21_000_000
-INITIAL_DAILY      = 7_200
-HALVING_THRESHOLD  = 2_100_000
-HALVING_MULTIPLIER = 0.9
+MAX_SUPPLY         = int(os.environ.get("DAEMON_MAX_SUPPLY", "21000000"))
+INITIAL_DAILY      = int(os.environ.get("DAEMON_INITIAL_DAILY", "7200"))
+HALVING_THRESHOLD  = int(os.environ.get("DAEMON_HALVING_THRESHOLD", "2100000"))
+HALVING_MULTIPLIER = float(os.environ.get("DAEMON_HALVING_MULTIPLIER", "0.9"))
 
-PROPOSAL_BASE_HOURS = 7 * 24
-PROPOSAL_COOLDOWN   = 17 * 24 * 3600
-PROPOSAL_BID_EVERY  = 2
-SYNC_COMMANDS_TO_GUILDS = os.environ.get("SYNC_COMMANDS_TO_GUILDS", "1").strip().lower() not in {"0", "false", "no"}
-COMMAND_SYNC_GUILD_IDS = [
-    int(gid.strip())
-    for gid in os.environ.get("COMMAND_SYNC_GUILD_IDS", "").split(",")
-    if gid.strip().isdigit()
-]
-PREFIX_COMMAND_BOT_IDS = _env_int_set("PREFIX_COMMAND_BOT_IDS")
+PROPOSAL_BASE_HOURS = int(os.environ.get("PROPOSAL_BASE_HOURS", str(7 * 24)))
+PROPOSAL_COOLDOWN   = int(os.environ.get("PROPOSAL_COOLDOWN_SECONDS", str(17 * 24 * 3600)))
+PROPOSAL_BID_EVERY  = int(os.environ.get("PROPOSAL_BID_EVERY", "2"))
+SYNC_COMMANDS_TO_GUILDS = env_bool("SYNC_COMMANDS_TO_GUILDS", True)
+COMMAND_SYNC_GUILD_IDS = parse_int_list_env("COMMAND_SYNC_GUILD_IDS")
+PREFIX_COMMAND_BOT_IDS = parse_int_set_env("PREFIX_COMMAND_BOT_IDS")
+DRAGON_ACCOUNT_PREFIX = os.environ.get("DRAGON_ACCOUNT_PREFIX", "DISCORD_")
+DEFAULT_DRAGON_TRANSFER_CONFIRM_THRESHOLD = float(os.environ.get("DRAGON_TRANSFER_CONFIRM_THRESHOLD", "50"))
+DEFAULT_DAEMON_TRANSFER_CONFIRM_THRESHOLD = float(os.environ.get("DAEMON_TRANSFER_CONFIRM_THRESHOLD", "50"))
+DRAGON_TRANSFER_CONFIRM_EMOJI = os.environ.get("DRAGON_TRANSFER_CONFIRM_EMOJI", "✅")
 
 CEST = ZoneInfo("Europe/Berlin")
-
-INITIAL_BALANCES = _env_initial_balances()
+INITIAL_BALANCES = parse_initial_balances()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -200,9 +220,9 @@ async def sync_application_commands_once():
 
     _commands_synced = True
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DATABASE (Daemon)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 DB_PATH = os.environ.get("DAEMON_DB_PATH", "/app/data/daemon.db")
 
 
@@ -291,6 +311,14 @@ def init_db():
             key         TEXT PRIMARY KEY,
             value       TEXT
         );
+        CREATE TABLE IF NOT EXISTS dragon_transfer_settings (
+            user_id               INTEGER PRIMARY KEY,
+            confirm_threshold_pct REAL NOT NULL DEFAULT 50
+        );
+        CREATE TABLE IF NOT EXISTS daemon_transfer_settings (
+            user_id               INTEGER PRIMARY KEY,
+            confirm_threshold_pct REAL NOT NULL DEFAULT 50
+        );
         """)
 
         migrations = [
@@ -330,9 +358,9 @@ def init_db():
             )
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ARENA SCHEDULING HELPERS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def compute_next_end_ts() -> float:
     """
     Returns the Unix timestamp at which the current convergence should resolve.
@@ -372,9 +400,9 @@ async def fetch_channel_safe(bot: commands.Bot, channel_id: int):
         return None
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # EMISSION
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_emission() -> dict:
     with get_db() as c:
         return dict(c.execute("SELECT * FROM emission WHERE id=1").fetchone())
@@ -412,9 +440,9 @@ def compute_payout(em: dict) -> int:
     return max(0, min(em["current_daily"], remaining))
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # BALANCES
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_balance(uid: int) -> int:
     with get_db() as c:
         row = c.execute("SELECT balance FROM balances WHERE user_id=?", (uid,)).fetchone()
@@ -481,9 +509,9 @@ async def update_satoshi_role(guild: Optional[discord.Guild]):
         await member.add_roles(role, reason="Satoshi Nakamoto claimant and top DAEMON holder")
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DAEMON MARKET
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_daemon_market_meta(key: str) -> str | None:
     with get_db() as c:
         row = c.execute("SELECT value FROM daemon_meta WHERE key=?", (key,)).fetchone()
@@ -620,7 +648,7 @@ async def reserve_vault_dragons(mc_uuid: str, amount: float):
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/convert/to_ub", json={"mc_uuid": mc_uuid, "amount": amount}) as r:
         if r.status != 200:
-            detail = "Failed to reserve 🐉."
+            detail = "Failed to reserve ðŸ‰."
             try:
                 detail = (await r.json()).get("detail", detail)
             except Exception:
@@ -634,7 +662,7 @@ async def credit_vault_dragons(mc_uuid: str, amount: float):
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/convert/to_vault", json={"mc_uuid": mc_uuid, "amount": amount}) as r:
         if r.status != 200:
-            detail = "Failed to credit 🐉."
+            detail = "Failed to credit ðŸ‰."
             try:
                 detail = (await r.json()).get("detail", detail)
             except Exception:
@@ -651,7 +679,7 @@ async def refund_vault_dragons(mc_uuid: str, amount: float, refund_id: str):
         json={"mc_uuid": mc_uuid, "amount": amount, "refund_id": refund_id},
     ) as r:
         if r.status != 200:
-            detail = "Failed to refund 🐉."
+            detail = "Failed to refund ðŸ‰."
             try:
                 detail = (await r.json()).get("detail", detail)
             except Exception:
@@ -744,13 +772,13 @@ async def log_daemon_trades(guild: Optional[discord.Guild], trades: list[dict]):
         return
     for t in trades:
         embed = discord.Embed(
-            title="✅  DAEMON Trade Executed",
+            title="âœ…  DAEMON Trade Executed",
             description=(
                 f"Buyer: <@{t['buyer_id']}>\n"
                 f"Seller: <@{t['seller_id']}>\n"
                 f"Amount: **{int(t['amount']):,} DAEMON**\n"
-                f"Price: **🐉 {float(t['price_per']):,.8f}** each\n"
-                f"Value: **🐉 {float(t['value']):,.4f}**"
+                f"Price: **ðŸ‰ {float(t['price_per']):,.8f}** each\n"
+                f"Value: **ðŸ‰ {float(t['value']):,.4f}**"
             ),
             color=0x00C853,
         )
@@ -761,8 +789,6 @@ async def log_daemon_trades(guild: Optional[discord.Guild], trades: list[dict]):
 
 
 async def maybe_send_daemon_holder_log():
-    if not ADMIN_USER_ID:
-        return
     now = datetime.now(CEST)
     today = now.strftime("%Y-%m-%d")
     if get_daemon_market_meta("holder_log_last_sent") == today:
@@ -774,15 +800,12 @@ async def maybe_send_daemon_holder_log():
             "SELECT user_id, balance FROM balances WHERE balance>0 ORDER BY balance DESC LIMIT 100"
         ).fetchall()
 
-    try:
-        user = await bot.fetch_user(ADMIN_USER_ID)
-    except Exception:
-        return
+    user = await bot.fetch_user(ADMIN_USER_ID)
     if not user:
         return
 
     if not rows:
-        await user.send(f"```\nDAEMON HOLDER LOG — {today}\n\nNo daemon holders found.\n```")
+        await user.send(f"```\nDAEMON HOLDER LOG â€” {today}\n\nNo daemon holders found.\n```")
         set_daemon_market_meta("holder_log_last_sent", today)
         return
 
@@ -796,7 +819,7 @@ async def maybe_send_daemon_holder_log():
         ]
         await user.send(
             "```\n"
-            f"DAEMON HOLDER LOG — {today}\n"
+            f"DAEMON HOLDER LOG â€” {today}\n"
             f"Ranks {start_rank}-{end_rank}\n\n"
             + "\n".join(lines)
             + "\n```"
@@ -807,9 +830,9 @@ async def maybe_send_daemon_holder_log():
     set_daemon_market_meta("holder_log_last_sent", today)
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ARENA DATA
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_arena() -> dict:
     with get_db() as c:
         return dict(c.execute("SELECT * FROM arena WHERE id=1").fetchone())
@@ -894,17 +917,17 @@ def expire_autosplit(uid: int):
         )
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # VISUAL HELPERS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def block_bar(progress: float, length: int = 15) -> str:
     n = max(0, min(length, round(progress * length)))
-    return "█" * n + "░" * (length - n)
+    return "â–ˆ" * n + "â–‘" * (length - n)
 
 
 def star_bar(progress: float, length: int = 20) -> str:
     n = max(0, min(length, round(progress * length)))
-    return "★" * n + "☆" * (length - n)
+    return "â˜…" * n + "â˜†" * (length - n)
 
 
 def proposal_bar(pct_current: float, threshold: int, length: int = 22) -> str:
@@ -913,11 +936,11 @@ def proposal_bar(pct_current: float, threshold: int, length: int = 22) -> str:
     bar = []
     for i in range(length):
         if i == tpos:
-            bar.append("┃")
+            bar.append("â”ƒ")
         elif i < cpos:
-            bar.append("★")
+            bar.append("â˜…")
         else:
-            bar.append("☆")
+            bar.append("â˜†")
     return "".join(bar)
 
 
@@ -929,9 +952,9 @@ def gen_txid() -> str:
     return "DMN-" + uuid.uuid4().hex[:12].upper()
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ARENA RESOLUTION
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def resolve_arena(game_id: int, pot: int):
     invs = get_investments(game_id)
     if not invs:
@@ -947,7 +970,7 @@ def resolve_arena(game_id: int, pot: int):
     if len(active) == 0:
         return {}, [], "No investments at all."
     if len(active) == 1:
-        return {}, [], "Only one option was committed to — void day."
+        return {}, [], "Only one option was committed to â€” void day."
 
     def first_ts(k): return min(p["ts"] for p in pools[k]) if pools[k] else float("inf")
 
@@ -968,10 +991,10 @@ def resolve_arena(game_id: int, pot: int):
         _merge(pm, _split_pool(pools[underdog], underdog_reward))
         _merge(pm, _split_pool(pools[winner], fight_reward))
         lines = [
-            f"🥉 UNDERDOG  ▸ {underdog.upper()} ({totals[underdog]:,})",
-            f"🥇 BIGGEST   ▸ {biggest.upper()} ({totals[biggest]:,})",
-            f"🥈 2ND PLACE ▸ {second.upper()} ({totals[second]:,})",
-            f"⚔  FIGHT    ▸ {biggest.upper()} vs {second.upper()}",
+            f"ðŸ¥‰ UNDERDOG  â–¸ {underdog.upper()} ({totals[underdog]:,})",
+            f"ðŸ¥‡ BIGGEST   â–¸ {biggest.upper()} ({totals[biggest]:,})",
+            f"ðŸ¥ˆ 2ND PLACE â–¸ {second.upper()} ({totals[second]:,})",
+            f"âš”  FIGHT    â–¸ {biggest.upper()} vs {second.upper()}",
         ]
         return pm, lines, None
 
@@ -993,10 +1016,10 @@ def resolve_arena(game_id: int, pot: int):
     _merge(pm, _split_pool(pools[winner], fight_reward))
 
     lines = [
-        f"🥉 UNDERDOG  ▸ {underdog.upper()} ({totals[underdog]:,})",
-        f"🥇 BIGGEST   ▸ {biggest.upper()} ({totals[biggest]:,})",
-        f"🥈 2ND PLACE ▸ {second.upper()} ({totals[second]:,})",
-        f"⚔  FIGHT    ▸ {biggest.upper()} vs {second.upper()}",
+        f"ðŸ¥‰ UNDERDOG  â–¸ {underdog.upper()} ({totals[underdog]:,})",
+        f"ðŸ¥‡ BIGGEST   â–¸ {biggest.upper()} ({totals[biggest]:,})",
+        f"ðŸ¥ˆ 2ND PLACE â–¸ {second.upper()} ({totals[second]:,})",
+        f"âš”  FIGHT    â–¸ {biggest.upper()} vs {second.upper()}",
     ]
     return pm, lines, None
 
@@ -1033,9 +1056,9 @@ def _merge(base: dict, extra: dict):
         base[uid] = base.get(uid, 0) + amt
 
 
-# ─────────────────────────────────────────────────────────────────
-# EMBEDS — DASHBOARD
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# EMBEDS â€” DASHBOARD
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def format_arena_display_id(game_date: str) -> str:
@@ -1075,16 +1098,16 @@ def build_dashboard_embed(game_id: int, game_date: str, pot: int, end_ts: float)
 
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║  DAEMON ARENA  {format_arena_display_id(game_date):<16}          ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘  DAEMON ARENA  {format_arena_display_id(game_date):<16}          â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         f"{D}  {game_date}{R}",
-        f"{Y}  EMISSION ▸ {pot:,} DAEMON{R}",
+        f"{Y}  EMISSION â–¸ {pot:,} DAEMON{R}",
         "",
     ]
 
     if sorted_users:
-        lines += [f"{C}  ┌─ COMMITTED ──────────────────────────────┐{R}"]
+        lines += [f"{C}  â”Œâ”€ COMMITTED â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}"]
         for rank, (uid, total) in enumerate(sorted_users, 1):
             pct = total / grand if grand else 0
             bar = block_bar(pct, 14)
@@ -1092,31 +1115,31 @@ def build_dashboard_embed(game_id: int, game_date: str, pot: int, end_ts: float)
             amt_str = f"{total:,}"
             name = _dashboard_name_for_uid(uid)
             lines += [
-                f"{W}  │  {rank:>2}. {name}{R}",
-                f"{g}  │      [{bar}] {pct_str}  {amt_str}{R}",
+                f"{W}  â”‚  {rank:>2}. {name}{R}",
+                f"{g}  â”‚      [{bar}] {pct_str}  {amt_str}{R}",
             ]
-        lines += [f"{C}  └──────────────────────────────────────────┘{R}", ""]
+        lines += [f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}", ""]
     else:
         lines += [f"{D}  [ no commits yet ]{R}", ""]
 
     lines += [
-        f"{D}  POOL SIZES  ──  \u001b[1;31m[ HIDDEN UNTIL REVEAL ]{R}",
-        f"{D}  🪨 ROCK      [██████████████████]{R}",
-        f"{D}  📄 PAPER     [██████████████████]{R}",
-        f"{D}  ✂️ SCISSORS  [██████████████████]{R}",
+        f"{D}  POOL SIZES  â”€â”€  \u001b[1;31m[ HIDDEN UNTIL REVEAL ]{R}",
+        f"{D}  ðŸª¨ ROCK      [â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆ]{R}",
+        f"{D}  ðŸ“„ PAPER     [â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆ]{R}",
+        f"{D}  âœ‚ï¸ SCISSORS  [â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆ]{R}",
         "",
-        f"{Y}  TOTAL COMMITTED ▸ {grand:,} DAEMON{R}",
+        f"{Y}  TOTAL COMMITTED â–¸ {grand:,} DAEMON{R}",
         "```",
     ]
 
     embed = discord.Embed(description="\n".join(lines), color=0x00FF41)
-    embed.set_footer(text="Picks are hidden until reveal  •  Min pledge: 1 DAEMON  •  Buttons commit 111")
+    embed.set_footer(text="Picks are hidden until reveal  â€¢  Min pledge: 1 DAEMON  â€¢  Buttons commit 111")
     return embed
 
 
-# ─────────────────────────────────────────────────────────────────
-# EMBEDS — REVEAL
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# EMBEDS â€” REVEAL
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def build_reveal_embed(
     game_id: int, game_date: str, pot: int,
     result_lines: list, payout_map: dict,
@@ -1140,65 +1163,65 @@ def build_reveal_embed(
 
     lines = [
         "```ansi",
-        f"{RR}╔══════════════════════════════════════════╗",
-        f"║  CONSENSUS REACHED  {format_arena_display_id(game_date):<16}     ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{RR}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘  CONSENSUS REACHED  {format_arena_display_id(game_date):<16}     â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         f"{D}  {game_date}{R}",
         "",
-        f"{C}  ┌─ POOL REVEAL ──────────────────────────┐{R}",
+        f"{C}  â”Œâ”€ POOL REVEAL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
     ]
 
-    for opt, emoji in [("rock", "🪨"), ("paper", "📄"), ("scissors", "✂️")]:
+    for opt, emoji in [("rock", "ðŸª¨"), ("paper", "ðŸ“„"), ("scissors", "âœ‚ï¸")]:
         t   = pool_totals[opt]
         pct = t / grand if grand else 0
         bar = block_bar(pct, 15)
-        lines.append(f"{W}  │  {emoji} {opt.upper():<9} [{bar}] {t:,}{R}")
+        lines.append(f"{W}  â”‚  {emoji} {opt.upper():<9} [{bar}] {t:,}{R}")
 
-    lines += [f"{C}  └────────────────────────────────────────┘{R}", ""]
+    lines += [f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}", ""]
 
     if void_reason:
         lines += [
-            f"{Y}  ⚠  VOID DAY{R}",
+            f"{Y}  âš   VOID DAY{R}",
             f"{Y}  {void_reason}{R}",
             f"{Y}  No DAEMON were distributed. This day is skipped.{R}",
         ]
     else:
-        lines += [f"{C}  ┌─ OUTCOME ──────────────────────────────┐{R}"]
+        lines += [f"{C}  â”Œâ”€ OUTCOME â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}"]
         for rl in result_lines:
-            lines.append(f"{W}  │  {rl}{R}")
-        lines += [f"{C}  └────────────────────────────────────────┘{R}", ""]
+            lines.append(f"{W}  â”‚  {rl}{R}")
+        lines += [f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}", ""]
 
         if payout_map:
-            lines += [f"{G}  ┌─ PAYOUTS ──────────────────────────────┐{R}"]
+            lines += [f"{G}  â”Œâ”€ PAYOUTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}"]
             for uid, coins in sorted(payout_map.items(), key=lambda x: -x[1]):
                 name = _dashboard_name_for_uid(uid)
-                lines.append(f"{g}  │  {name}  +{coins:,} DAEMON{R}")
-            lines += [f"{G}  └────────────────────────────────────────┘{R}", ""]
+                lines.append(f"{g}  â”‚  {name}  +{coins:,} DAEMON{R}")
+            lines += [f"{G}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}", ""]
 
         if distributed_amount > 0:
-            lines.append(f"{P}  ⛏  EMITTED ▸ {distributed_amount:,} DAEMON distributed this cycle{R}")
+            lines.append(f"{P}  â›  EMITTED â–¸ {distributed_amount:,} DAEMON distributed this cycle{R}")
 
     if user_inv:
-        lines += ["", f"{C}  ┌─ PLAYER BREAKDOWN ──────────────────────┐{R}"]
+        lines += ["", f"{C}  â”Œâ”€ PLAYER BREAKDOWN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}"]
         for uid, choices in user_inv.items():
             detail  = "  ".join(f"{c.upper()}:{a:,}" for c, a in choices.items())
             won     = payout_map.get(uid, 0)
             won_str = f"  {g}+{won:,}{R}" if won else f"  {D}+0{R}"
             name = _dashboard_name_for_uid(uid)
             lines  += [
-                f"{W}  │  {name}{R}",
-                f"{W}  │    {detail}{won_str}",
+                f"{W}  â”‚  {name}{R}",
+                f"{W}  â”‚    {detail}{won_str}",
             ]
-        lines.append(f"{C}  └──────────────────────────────────────────┘{R}")
+        lines.append(f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}")
 
     lines.append("```")
     color = 0xFF3333 if void_reason else 0x00FF41
     return discord.Embed(description="\n".join(lines), color=color)
 
 
-# ─────────────────────────────────────────────────────────────────
-# EMBEDS — BALANCE (Daemon)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# EMBEDS â€” BALANCE (Daemon)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def build_balance_embed(user: discord.Member, bal: int) -> discord.Embed:
     circ      = get_circulating_supply()
     share_pct = bal / circ * 100 if circ else 0
@@ -1209,14 +1232,14 @@ def build_balance_embed(user: discord.Member, bal: int) -> discord.Embed:
 
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║          W A L L E T   A C C E S S       ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘          W A L L E T   A C C E S S       â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{D}  USER ▸ {user.display_name}{R}",
-        f"{D}  ID   ▸ {user.id}{R}",
+        f"{D}  USER â–¸ {user.display_name}{R}",
+        f"{D}  ID   â–¸ {user.id}{R}",
         "",
-        f"{G}  BALANCE ▸ {bal:,} DAEMON{R}",
+        f"{G}  BALANCE â–¸ {bal:,} DAEMON{R}",
         f"{W}  Share of circulating supply: {share_pct:.4f}%{R}",
         f"{g}  [{bar}]{R}",
         "",
@@ -1226,27 +1249,27 @@ def build_balance_embed(user: discord.Member, bal: int) -> discord.Embed:
     return discord.Embed(description="\n".join(lines), color=0x00FF41)
 
 
-# ─────────────────────────────────────────────────────────────────
-# EMBEDS — TRANSACTION (Daemon)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# EMBEDS â€” TRANSACTION (Daemon)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def build_tx_sender_embed(recipient: discord.Member, amount: int, txid: str, hidden: bool, new_bal: int, message: str | None = None) -> discord.Embed:
     G = "\u001b[1;32m"; RR = "\u001b[1;31m"; W = "\u001b[0;37m"; D = "\u001b[0;90m"; R = "\u001b[0m"
     tag = "HIDDEN" if hidden else "PUBLIC"
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║         T R A N S F E R   S E N T        ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘         T R A N S F E R   S E N T        â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{D}  TX-ID  ▸ {txid}{R}",
-        f"{D}  MODE   ▸ {tag}{R}",
+        f"{D}  TX-ID  â–¸ {txid}{R}",
+        f"{D}  MODE   â–¸ {tag}{R}",
         "",
-        f"{W}  TO      ▸ {recipient.display_name}{R}",
-        f"{RR}  SENT    ▸ -{amount:,} DAEMON{R}",
-        f"{W}  BALANCE ▸ {new_bal:,} DAEMON{R}",
+        f"{W}  TO      â–¸ {recipient.display_name}{R}",
+        f"{RR}  SENT    â–¸ -{amount:,} DAEMON{R}",
+        f"{W}  BALANCE â–¸ {new_bal:,} DAEMON{R}",
     ]
     if message:
-        lines += ["", f"\u001b[0;35m  MSG  ▸ {message[:200]}{R}"]
+        lines += ["", f"\u001b[0;35m  MSG  â–¸ {message[:200]}{R}"]
     lines += ["", f"{D}  {ts_now()}{R}",
         "```",
     ]
@@ -1259,17 +1282,17 @@ def build_tx_recipient_embed(sender: discord.Member, amount: int, txid: str, hid
     tag        = "ANONYMOUS TRANSFER" if hidden else "TRANSFER RECEIVED"
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║     {tag:<37}║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘     {tag:<37}â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{D}  TX-ID ▸ {txid}{R}",
-        f"{W}  FROM  ▸ {sender_str}{R}",
-        f"{g}  AMT   ▸ +{amount:,} DAEMON{R}",
-        f"{W}  BAL   ▸ {new_bal:,} DAEMON{R}",
+        f"{D}  TX-ID â–¸ {txid}{R}",
+        f"{W}  FROM  â–¸ {sender_str}{R}",
+        f"{g}  AMT   â–¸ +{amount:,} DAEMON{R}",
+        f"{W}  BAL   â–¸ {new_bal:,} DAEMON{R}",
     ]
     if message:
-        lines += ["", f"\u001b[0;35m  MSG  ▸ {message[:200]}{R}"]
+        lines += ["", f"\u001b[0;35m  MSG  â–¸ {message[:200]}{R}"]
     lines += ["", f"{D}  {ts_now()}{R}",
         "```",
     ]
@@ -1282,19 +1305,19 @@ def build_tx_log_embed(sender: discord.Member, recipient: discord.Member, amount
     sender_str = "ANONYMOUS" if hidden else f"{sender.display_name} ({sender.id})"
     lines = [
         "```ansi",
-        f"{Y}╔══════════════════════════════════════════╗",
-        f"║       T R A N S A C T I O N   L O G      ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{Y}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘       T R A N S A C T I O N   L O G      â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{D}  TX-ID ▸ {txid}{R}",
-        f"{D}  TYPE  ▸ {tag}{R}",
+        f"{D}  TX-ID â–¸ {txid}{R}",
+        f"{D}  TYPE  â–¸ {tag}{R}",
         "",
-        f"{W}  FROM  ▸ {sender_str}{R}",
-        f"{W}  TO    ▸ {recipient.display_name} ({recipient.id}){R}",
-        f"{g}  AMT   ▸ {amount:,} DAEMON{R}",
+        f"{W}  FROM  â–¸ {sender_str}{R}",
+        f"{W}  TO    â–¸ {recipient.display_name} ({recipient.id}){R}",
+        f"{g}  AMT   â–¸ {amount:,} DAEMON{R}",
     ]
     if message:
-        lines += ["", f"\u001b[0;35m  MSG  ▸ {message[:200]}{R}"]
+        lines += ["", f"\u001b[0;35m  MSG  â–¸ {message[:200]}{R}"]
     lines += ["", f"{D}  {ts_now()}{R}",
         "```",
     ]
@@ -1302,9 +1325,9 @@ def build_tx_log_embed(sender: discord.Member, recipient: discord.Member, amount
     return discord.Embed(description="\n".join(lines), color=color)
 
 
-# ─────────────────────────────────────────────────────────────────
-# EMBEDS — DAEMON INFO
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# EMBEDS â€” DAEMON INFO
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def build_daemon_info_embed() -> discord.Embed:
     em      = get_emission()
     em      = maybe_apply_reduction(em)
@@ -1336,36 +1359,36 @@ def build_daemon_info_embed() -> discord.Embed:
 
     lines = [
         "```ansi",
-        f"{Y}╔══════════════════════════════════════════╗",
-        f"║       D A E M O N   E C O N O M Y        ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{Y}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘       D A E M O N   E C O N O M Y        â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{C}  ┌─ SUPPLY ───────────────────────────────┐{R}",
-        f"{W}  │  Circulating  {circ:>14,}{R}",
-        f"{W}  │  Hard Cap     {MAX_SUPPLY:>14,}{R}",
-        f"{W}  │  Of hard cap  {supply_pct*100:>13.6f}%{R}",
-        f"{g}  │  [{block_bar(supply_pct, 20)}]{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ SUPPLY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  Circulating  {circ:>14,}{R}",
+        f"{W}  â”‚  Hard Cap     {MAX_SUPPLY:>14,}{R}",
+        f"{W}  â”‚  Of hard cap  {supply_pct*100:>13.6f}%{R}",
+        f"{g}  â”‚  [{block_bar(supply_pct, 20)}]{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{C}  ┌─ EMISSION ─────────────────────────────┐{R}",
-        f"{P}  │  Phase        {phase}{R}",
-        f"{W}  │  Daily Emission {daily:>14,}{R}",
-        f"{W}  │  Elapsed      {days_elapsed:>13.1f}d{R}",
-        f"{W}  │  Next change  {days_left:>13.1f}d{R}",
-        f"{D}  │  {cycle_lbl}{R}",
-        f"{Y}  │  [{block_bar(prog, 20)}]{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ EMISSION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{P}  â”‚  Phase        {phase}{R}",
+        f"{W}  â”‚  Daily Emission {daily:>14,}{R}",
+        f"{W}  â”‚  Elapsed      {days_elapsed:>13.1f}d{R}",
+        f"{W}  â”‚  Next change  {days_left:>13.1f}d{R}",
+        f"{D}  â”‚  {cycle_lbl}{R}",
+        f"{Y}  â”‚  [{block_bar(prog, 20)}]{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{W}  Holders  ▸ {G}{holders}{R}",
+        f"{W}  Holders  â–¸ {G}{holders}{R}",
         f"{D}  {ts_now()}{R}",
         "```",
     ]
     return discord.Embed(description="\n".join(lines), color=0xF7931A)
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # PROPOSALS DB
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_circulating_supply() -> int:
     with get_db() as c:
         row = c.execute("SELECT SUM(balance) FROM balances WHERE balance>0").fetchone()
@@ -1410,42 +1433,42 @@ def build_proposal_embed(prop: dict) -> discord.Embed:
     RR = "\u001b[1;31m"; R = "\u001b[0m"
 
     status_c = G if passed else (RR if expired else Y)
-    status   = "PASSED ✓" if passed else ("EXPIRED" if expired else "ACTIVE")
+    status   = "PASSED âœ“" if passed else ("EXPIRED" if expired else "ACTIVE")
     net_bar  = proposal_bar(network_yes_pct, threshold, 22)
     tpad     = max(0, round(threshold / 100 * 22) - 1)
 
     sent_n    = 22
     yes_cells = max(0, min(sent_n, round(sentiment_pct / 100 * sent_n)))
     no_cells  = sent_n - yes_cells
-    sent_bar  = f"{G}" + "█" * yes_cells + f"{RR}" + "█" * no_cells + f"{R}"
+    sent_bar  = f"{G}" + "â–ˆ" * yes_cells + f"{RR}" + "â–ˆ" * no_cells + f"{R}"
 
     lines = [
         "```ansi",
-        f"{P}╔══════════════════════════════════════════╗",
-        f"║  PROPOSAL #{prop['id']:<5}                        ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{P}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘  PROPOSAL #{prop['id']:<5}                        â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
         f"{W}  {prop['text']}{R}",
         "",
-        f"{C}  ┌─ VOTE STATUS ──────────────────────────┐{R}",
-        f"{W}  │  Author    ▸ <@{prop['author_id']}>{R}",
-        f"{W}  │  Required  ▸ {threshold}% of circulating supply (YES weight) to pass{R}",
-        f"{W}  │  Duration  ▸ {duration_hours}h  (expires <t:{expires_ts}:R>){R}",
-        f"{W}  │  Wallets   ▸ {holders}{R}",
-        f"{W}  │  Votes     ▸ {total_votes} total  ({G}✓ {yes_count}{R}  {RR}✗ {no_count}{R}){R}",
+        f"{C}  â”Œâ”€ VOTE STATUS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  Author    â–¸ <@{prop['author_id']}>{R}",
+        f"{W}  â”‚  Required  â–¸ {threshold}% of circulating supply (YES weight) to pass{R}",
+        f"{W}  â”‚  Duration  â–¸ {duration_hours}h  (expires <t:{expires_ts}:R>){R}",
+        f"{W}  â”‚  Wallets   â–¸ {holders}{R}",
+        f"{W}  â”‚  Votes     â–¸ {total_votes} total  ({G}âœ“ {yes_count}{R}  {RR}âœ— {no_count}{R}){R}",
         "",
-        f"{C}  │  NETWORK AGREEMENT  ({network_yes_pct:.1f}% of circulating supply){R}",
-        f"{P}  │  0%[{net_bar}]100%{R}",
-        f"{D}  │      {' ' * tpad}↑ threshold ({threshold}%){R}",
+        f"{C}  â”‚  NETWORK AGREEMENT  ({network_yes_pct:.1f}% of circulating supply){R}",
+        f"{P}  â”‚  0%[{net_bar}]100%{R}",
+        f"{D}  â”‚      {' ' * tpad}â†‘ threshold ({threshold}%){R}",
         "",
-        f"{C}  │  VOTER SENTIMENT  (of those who voted){R}",
-        f"  │  [{sent_bar}]",
-        f"{G}  │  YES {yes_count} ({sentiment_pct:.1f}%)  {RR}NO {no_count} ({100-sentiment_pct:.1f}%){R}",
+        f"{C}  â”‚  VOTER SENTIMENT  (of those who voted){R}",
+        f"  â”‚  [{sent_bar}]",
+        f"{G}  â”‚  YES {yes_count} ({sentiment_pct:.1f}%)  {RR}NO {no_count} ({100-sentiment_pct:.1f}%){R}",
         "",
-        f"  │  Status ▸ {status_c}{status}{R}",
-        f"{C}  └───────────────────────────────────────┘{R}",
+        f"  â”‚  Status â–¸ {status_c}{status}{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{Y}  ⚠  ADVISORY ONLY — votes are recorded but not{R}",
+        f"{Y}  âš   ADVISORY ONLY â€” votes are recorded but not{R}",
         f"{Y}     binding or effective at this time.{R}",
         "",
         f"{D}  {ts_now()}{R}",
@@ -1605,9 +1628,9 @@ def vote_proposal(pid: int, uid: int, vote: str) -> tuple[bool, str]:
     return True, "Vote cast."
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # BOT SETUP
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -1615,9 +1638,9 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # VIEWS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class ArenaView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1625,26 +1648,26 @@ class ArenaView(discord.ui.View):
     async def _invest(self, interaction: discord.Interaction, choice: str):
         arena = get_arena()
         if not arena["game_open"]:
-            await interaction.response.send_message("❌ No convergence is currently active.", ephemeral=True)
+            await interaction.response.send_message("âŒ No convergence is currently active.", ephemeral=True)
             return
         uid = interaction.user.id
         bal = get_balance(uid)
         if bal < 111:
             await interaction.response.send_message(
-                f"❌ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}", ephemeral=True
+                f"âŒ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}", ephemeral=True
             )
             return
         add_balance(uid, -111)
         add_investment(uid, choice, 111, arena["game_date"], arena["game_id"])
 
         D = "\u001b[0;90m"; G = "\u001b[1;32m"; W = "\u001b[0;37m"; Y = "\u001b[0;33m"; R = "\u001b[0m"
-        choice_emoji = {"rock": "🪨 ROCK", "paper": "📄 PAPER", "scissors": "✂️  SCISSORS"}
+        choice_emoji = {"rock": "ðŸª¨ ROCK", "paper": "ðŸ“„ PAPER", "scissors": "âœ‚ï¸  SCISSORS"}
         lines = [
             "```ansi",
-            f"{G}  COMMIT CONFIRMED  ▸  111 DAEMON{R}",
-            f"{D}  Arena Date   ▸ {arena['game_date'][:10]}{R}",
-            f"{Y}  Pledged  ▸ {choice_emoji[choice]}{R}",
-            f"{W}  Bal      ▸ {get_balance(uid):,} DAEMON{R}",
+            f"{G}  COMMIT CONFIRMED  â–¸  111 DAEMON{R}",
+            f"{D}  Arena Date   â–¸ {arena['game_date'][:10]}{R}",
+            f"{Y}  Pledged  â–¸ {choice_emoji[choice]}{R}",
+            f"{W}  Bal      â–¸ {get_balance(uid):,} DAEMON{R}",
             "```",
         ]
         embed = discord.Embed(description="\n".join(lines), color=0x00FF41)
@@ -1657,15 +1680,15 @@ class ArenaView(discord.ui.View):
         await update_dashboard(get_arena())
         await update_satoshi_role(interaction.guild)
 
-    @discord.ui.button(label="🪨  ROCK",      style=discord.ButtonStyle.secondary, custom_id="arena_rock")
+    @discord.ui.button(label="ðŸª¨  ROCK",      style=discord.ButtonStyle.secondary, custom_id="arena_rock")
     async def rock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._invest(interaction, "rock")
 
-    @discord.ui.button(label="📄  PAPER",     style=discord.ButtonStyle.primary,   custom_id="arena_paper")
+    @discord.ui.button(label="ðŸ“„  PAPER",     style=discord.ButtonStyle.primary,   custom_id="arena_paper")
     async def paper_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._invest(interaction, "paper")
 
-    @discord.ui.button(label="✂️  SCISSORS",  style=discord.ButtonStyle.danger,    custom_id="arena_scissors")
+    @discord.ui.button(label="âœ‚ï¸  SCISSORS",  style=discord.ButtonStyle.danger,    custom_id="arena_scissors")
     async def scissors_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._invest(interaction, "scissors")
 
@@ -1675,11 +1698,11 @@ class ProposalView(discord.ui.View):
         super().__init__(timeout=None)
         self.proposal_id = proposal_id
         self.add_item(discord.ui.Button(
-            label="✅  YES", style=discord.ButtonStyle.success,
+            label="âœ…  YES", style=discord.ButtonStyle.success,
             custom_id=f"prop_yes_{proposal_id}"
         ))
         self.add_item(discord.ui.Button(
-            label="❌  NO", style=discord.ButtonStyle.danger,
+            label="âŒ  NO", style=discord.ButtonStyle.danger,
             custom_id=f"prop_no_{proposal_id}"
         ))
 
@@ -1696,7 +1719,7 @@ class ProposalView(discord.ui.View):
 
         ok, msg = vote_proposal(pid, interaction.user.id, vote)
         if not ok:
-            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+            await interaction.response.send_message(f"âŒ {msg}", ephemeral=True)
             return False
         prop = get_proposal(pid)
         await interaction.response.edit_message(embed=build_proposal_embed(prop), view=self)
@@ -1731,7 +1754,7 @@ async def _sync_dashboard_message(arena: dict | None = None, *, force_new: bool 
             return None
 
     try:
-        header = f"```ansi\n\u001b[1;32m▶ DAEMON ARENA {format_arena_display_id(arena['game_date'])} (LIVE)\u001b[0m\n```"
+        header = f"```ansi\n\u001b[1;32mâ–¶ DAEMON ARENA {format_arena_display_id(arena['game_date'])} (LIVE)\u001b[0m\n```"
         msg = await ch.send(content=header, embed=embed, view=ArenaView())
         set_arena(dashboard_msg=msg.id)
         return msg.id
@@ -1766,7 +1789,7 @@ async def arena_cycle():
         return
 
     if _arena_resolution_lock.locked():
-        log.warning("Arena resolution already in progress — skipping this tick.")
+        log.warning("Arena resolution already in progress â€” skipping this tick.")
         return
 
     async with _arena_resolution_lock:
@@ -1812,7 +1835,7 @@ async def arena_cycle():
 
         view = ArenaView()
         embed = build_dashboard_embed(new_gid, new_date, pot, end_ts)
-        header = f"```ansi\n\u001b[1;32m▶ DAEMON ARENA {format_arena_display_id(new_date)}\u001b[0m\n```"
+        header = f"```ansi\n\u001b[1;32mâ–¶ DAEMON ARENA {format_arena_display_id(new_date)}\u001b[0m\n```"
         msg = await ch.send(content=header, embed=embed, view=view)
 
         set_arena(game_open=1, game_date=new_date, dashboard_msg=msg.id, pot=pot, cycle_start_ts=now, game_id=new_gid, next_end_ts=end_ts)
@@ -1847,7 +1870,7 @@ async def _execute_autosplits(arena_ch, game_id: int, game_date: str):
             try:
                 user = await bot.fetch_user(uid)
                 await user.send(
-                    f"⚠️ Your **Daily Auto-Split** ({amount:,} DAEMON/game) has been **cancelled** because your balance (`{bal:,}`) is too low to cover the next split.\nUse `/daemon dailysplit <amount>` to re-enable it."
+                    f"âš ï¸ Your **Daily Auto-Split** ({amount:,} DAEMON/game) has been **cancelled** because your balance (`{bal:,}`) is too low to cover the next split.\nUse `/daemon dailysplit <amount>` to re-enable it."
                 )
             except Exception:
                 pass
@@ -1872,21 +1895,298 @@ async def _execute_autosplits(arena_ch, game_id: int, game_date: str):
             try:
                 user = await bot.fetch_user(uid)
                 await user.send(
-                    f"ℹ️ Your **Daily Auto-Split** ({amount:,} DAEMON/game) has **expired** — it ran for the configured number of games.\nUse `/daemon dailysplit <amount>` to start a new one."
+                    f"â„¹ï¸ Your **Daily Auto-Split** ({amount:,} DAEMON/game) has **expired** â€” it ran for the configured number of games.\nUse `/daemon dailysplit <amount>` to start a new one."
                 )
             except Exception:
                 pass
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ECONOMY HELPERS (MDragons)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def get_mc_uuid(discord_id: str) -> Optional[str]:
     session = await get_http_session()
     async with session.get(f"{BASE_URL}/mc_uuid/{discord_id}") as r:
         if r.status == 200:
             return (await r.json())["mc_uuid"]
     return None
+
+
+def dragon_account_uuid(discord_id: int | str) -> str:
+    return f"{DRAGON_ACCOUNT_PREFIX}{str(discord_id).strip()}"
+
+
+def get_dragon_transfer_threshold(user_id: int) -> float:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT confirm_threshold_pct FROM dragon_transfer_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return DEFAULT_DRAGON_TRANSFER_CONFIRM_THRESHOLD
+    return float(row["confirm_threshold_pct"])
+
+
+def set_dragon_transfer_threshold(user_id: int, percent: float):
+    percent = max(0.0, min(100.0, float(percent)))
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO dragon_transfer_settings (user_id, confirm_threshold_pct)
+               VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET confirm_threshold_pct=excluded.confirm_threshold_pct""",
+            (user_id, percent),
+        )
+
+
+def get_daemon_transfer_threshold(user_id: int) -> float:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT confirm_threshold_pct FROM daemon_transfer_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return DEFAULT_DAEMON_TRANSFER_CONFIRM_THRESHOLD
+    return float(row["confirm_threshold_pct"])
+
+
+def set_daemon_transfer_threshold(user_id: int, percent: float):
+    percent = max(0.0, min(100.0, float(percent)))
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO daemon_transfer_settings (user_id, confirm_threshold_pct)
+               VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET confirm_threshold_pct=excluded.confirm_threshold_pct""",
+            (user_id, percent),
+        )
+
+
+def locked_daemon_for_user(user_id: int) -> int:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(remaining), 0) AS locked FROM daemon_orders WHERE user_id=? AND side='sell' AND remaining>0",
+            (user_id,),
+        ).fetchone()
+    return int(row["locked"] if row else 0)
+
+
+def daemon_net_worth(user_id: int) -> int:
+    return int(get_balance(user_id)) + locked_daemon_for_user(user_id)
+
+
+async def fetch_economy_balance(owner_uuid: str) -> Optional[dict]:
+    session = await get_http_session()
+    async with session.get(f"{BASE_URL}/balance/{owner_uuid}") as r:
+        if r.status != 200:
+            return None
+        return await r.json()
+
+
+async def fetch_dragon_balance(discord_id: int) -> Optional[dict]:
+    return await fetch_economy_balance(dragon_account_uuid(discord_id))
+
+
+async def resolve_dragon_amount(amount_raw: str, sender_id: int) -> tuple[Optional[int], Optional[str], Optional[dict]]:
+    balance = await fetch_dragon_balance(sender_id)
+    if balance is None:
+        return None, "Error fetching Dragon balance.", None
+
+    available = int(float(balance.get("mdragons", 0) or 0))
+    token = amount_raw.strip().lower()
+    if token == "all":
+        amount = available
+    else:
+        digits = re.sub(r"[,\s_]", "", token)
+        if not digits.isdigit():
+            return None, "Amount must be a positive whole number or `all`.", balance
+        amount = int(digits)
+
+    if amount <= 0:
+        return None, "Amount must be positive.", balance
+    if amount > available:
+        return None, f"Insufficient dragons. Available: **{available:,}**.", balance
+    return amount, None, balance
+
+
+def dragon_transfer_needs_confirmation(user_id: int, amount: float, balance: dict) -> tuple[bool, float, int]:
+    threshold = get_dragon_transfer_threshold(user_id)
+    if threshold >= 100:
+        return False, threshold, int(float(balance.get("mdragons_total", balance.get("mdragons", 0)) or 0))
+    total = int(float(balance.get("mdragons_total", balance.get("mdragons", 0)) or 0))
+    return amount > (total * (threshold / 100.0)), threshold, total
+
+
+def daemon_transfer_needs_confirmation(user_id: int, amount: int) -> tuple[bool, float, int]:
+    threshold = get_daemon_transfer_threshold(user_id)
+    total = daemon_net_worth(user_id)
+    if threshold >= 100:
+        return False, threshold, total
+    return amount > (total * (threshold / 100.0)), threshold, total
+
+
+async def wait_for_dragon_transfer_confirmation(prompt: discord.Message, user_id: int) -> bool:
+    try:
+        await prompt.add_reaction(DRAGON_TRANSFER_CONFIRM_EMOJI)
+    except discord.HTTPException:
+        return False
+
+    def check(reaction: discord.Reaction, user: discord.User | discord.Member) -> bool:
+        return (
+            user.id == user_id
+            and reaction.message.id == prompt.id
+            and str(reaction.emoji) == DRAGON_TRANSFER_CONFIRM_EMOJI
+        )
+
+    try:
+        await bot.wait_for("reaction_add", timeout=60, check=check)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def format_dragon_amount_short(amount: float) -> str:
+    number = float(amount)
+    return f"{int(number):,}" if number.is_integer() else f"{number:,.2f}"
+
+
+def dragon_spend_confirmation_text(user_id: int, amount: float, threshold: float, total: int, action: str) -> str:
+    return (
+        f"<@{user_id}> confirm {action}: **{format_dragon_amount_short(amount)} dragons**.\n"
+        f"This is above your **{threshold:g}%** confirmation threshold "
+        f"(Dragon net worth: **{total:,} dragons**). React with {DRAGON_TRANSFER_CONFIRM_EMOJI} within 60 seconds."
+    )
+
+
+def daemon_spend_confirmation_text(user_id: int, amount: int, threshold: float, total: int, action: str) -> str:
+    return (
+        f"<@{user_id}> confirm {action}: **{int(amount):,} DAEMON**.\n"
+        f"This is above your **{threshold:g}%** confirmation threshold "
+        f"(DAEMON net worth: **{total:,} DAEMON**). React with {DRAGON_TRANSFER_CONFIRM_EMOJI} within 60 seconds."
+    )
+
+
+async def confirm_dragon_spend_in_channel(
+    channel: discord.abc.Messageable,
+    user_id: int,
+    amount: float,
+    balance: dict,
+    action: str,
+) -> bool:
+    needs_confirmation, threshold, total = dragon_transfer_needs_confirmation(user_id, amount, balance)
+    if not needs_confirmation:
+        return True
+    prompt = await channel.send(dragon_spend_confirmation_text(user_id, amount, threshold, total, action))
+    confirmed = await wait_for_dragon_transfer_confirmation(prompt, user_id)
+    if not confirmed:
+        try:
+            await prompt.reply("Transfer cancelled.", mention_author=False)
+        except discord.HTTPException:
+            pass
+    return confirmed
+
+
+async def confirm_dragon_spend_for_interaction(
+    interaction: discord.Interaction,
+    amount: float,
+    balance: dict,
+    action: str,
+) -> bool:
+    needs_confirmation, threshold, total = dragon_transfer_needs_confirmation(interaction.user.id, amount, balance)
+    if not needs_confirmation:
+        return True
+    text = dragon_spend_confirmation_text(interaction.user.id, amount, threshold, total, action)
+    if interaction.channel and hasattr(interaction.channel, "send"):
+        prompt = await interaction.channel.send(text)
+    else:
+        prompt = await interaction.followup.send(text, wait=True)
+    confirmed = await wait_for_dragon_transfer_confirmation(prompt, interaction.user.id)
+    if not confirmed:
+        await interaction.followup.send(embed=err_embed("Transfer cancelled."))
+    return confirmed
+
+
+async def confirm_daemon_spend_for_interaction(
+    interaction: discord.Interaction,
+    amount: int,
+    action: str,
+    prefer_dm: bool = False,
+) -> bool:
+    needs_confirmation, threshold, total = daemon_transfer_needs_confirmation(interaction.user.id, amount)
+    if not needs_confirmation:
+        return True
+
+    text = daemon_spend_confirmation_text(interaction.user.id, amount, threshold, total, action)
+    if prefer_dm:
+        try:
+            prompt = await interaction.user.send(text)
+        except discord.HTTPException:
+            await interaction.followup.send(
+                embed=err_embed("I couldn't DM you for hidden DAEMON confirmation. Enable DMs or send without hidden."),
+                ephemeral=True,
+            )
+            return False
+    elif interaction.channel and hasattr(interaction.channel, "send"):
+        prompt = await interaction.channel.send(text)
+    else:
+        prompt = await interaction.followup.send(text, wait=True)
+
+    confirmed = await wait_for_dragon_transfer_confirmation(prompt, interaction.user.id)
+    if not confirmed:
+        await interaction.followup.send(embed=err_embed("Action cancelled."), ephemeral=True)
+    return confirmed
+
+
+def dragon_transfer_confirmation_text(sender_id: int, recipient_id: int, amount: int, threshold: float, total: int) -> str:
+    return (
+        f"<@{sender_id}> confirm sending **ðŸ‰ {amount:,}** to <@{recipient_id}>.\n"
+        f"This is above your **{threshold:g}%** confirmation threshold "
+        f"(Dragon net worth: **ðŸ‰ {total:,}**). React with {DRAGON_TRANSFER_CONFIRM_EMOJI} within 60 seconds."
+    )
+
+
+async def confirm_dragon_transfer_in_channel(
+    channel: discord.abc.Messageable,
+    sender_id: int,
+    recipient_id: int,
+    amount: int,
+    balance: dict,
+) -> bool:
+    return await confirm_dragon_spend_in_channel(
+        channel,
+        sender_id,
+        amount,
+        balance,
+        f"sending dragons to <@{recipient_id}>",
+    )
+
+
+async def confirm_dragon_transfer_for_interaction(
+    interaction: discord.Interaction,
+    recipient_id: int,
+    amount: int,
+    balance: dict,
+) -> bool:
+    return await confirm_dragon_spend_for_interaction(
+        interaction,
+        amount,
+        balance,
+        f"sending dragons to <@{recipient_id}>",
+    )
+
+
+def build_economy_balance_embed(owner_label: str, data: dict, linked: bool) -> discord.Embed:
+    embed = discord.Embed(title="ðŸ’°  Economy++ Balance", color=BLUE)
+    embed.add_field(name="Owner", value=owner_label, inline=False)
+    embed.add_field(name="Netherite Ingots", value=f"**{data.get('netherite', 0)}**", inline=True)
+    embed.add_field(name="Diamonds", value=f"**{data.get('diamond', 0)}**", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="ðŸ‰ Vault", value=f"**ðŸ‰ {int(float(data.get('mdragons', 0))):,}**", inline=True)
+    embed.add_field(name="ðŸ‰ Locked in orders", value=f"**ðŸ‰ {int(float(data.get('mdragons_locked', 0))):,}**", inline=True)
+    embed.add_field(name="ðŸ‰ Total", value=f"**ðŸ‰ {int(float(data.get('mdragons_total', data.get('mdragons', 0)))):,}**", inline=True)
+    footer = "Locked = dragons reserved in open buy orders"
+    if not linked:
+        footer += "  Â·  Link Minecraft to view item vault balances"
+    embed.set_footer(text=footer)
+    return embed
 
 
 async def update_holder_role(
@@ -1960,11 +2260,11 @@ def item_display(item_key: str) -> str:
 
 
 def err_embed(msg: str) -> discord.Embed:
-    return discord.Embed(description=f"❌  {msg}", color=RED)
+    return discord.Embed(description=f"âŒ  {msg}", color=RED)
 
 
 def ok_embed(msg: str) -> discord.Embed:
-    return discord.Embed(description=f"✅  {msg}", color=BLUE)
+    return discord.Embed(description=f"âœ…  {msg}", color=BLUE)
 
 
 async def log_transaction(guild: Optional[discord.Guild], title: str, description: str, color: int = BLUE):
@@ -2081,6 +2381,66 @@ async def get_required_mc_uuid(discord_id: int) -> tuple[Optional[str], Optional
     return mc_uuid, None
 
 
+def parse_whole_amount(raw: str) -> Optional[int]:
+    token = str(raw).strip().lower()
+    digits = re.sub(r"[,\s_]", "", token)
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+async def fetch_item_inventory(owner_uuid: str, item_type: str) -> Optional[dict]:
+    session = await get_http_session()
+    async with session.get(f"{BASE_URL}/inventory/{owner_uuid}/{item_type}") as r:
+        if r.status != 200:
+            return None
+        return await r.json()
+
+
+async def resolve_market_order_amount(
+    discord_id: int,
+    item_type: str,
+    amount_raw: str,
+    price_per: float,
+    side: str,
+) -> tuple[Optional[int], Optional[str], Optional[dict], float]:
+    if price_per <= 0:
+        return None, "Price must be positive.", None, 0.0
+
+    token = str(amount_raw).strip().lower()
+    owner_uuid = dragon_account_uuid(discord_id)
+    dragon_balance = await fetch_dragon_balance(discord_id) if side == "buy" else None
+
+    if token == "all":
+        if side == "buy":
+            if dragon_balance is None:
+                return None, "Error fetching Dragon balance.", None, 0.0
+            available = float(dragon_balance.get("mdragons", 0) or 0)
+            amount = math.floor(available / float(price_per))
+        else:
+            inv = await fetch_item_inventory(owner_uuid, item_type)
+            if inv is None:
+                return None, "Error fetching inventory.", None, 0.0
+            amount = math.floor(float(inv.get("vault", 0) or 0))
+    else:
+        amount = parse_whole_amount(token)
+        if amount is None:
+            return None, "Amount must be a positive whole number or `all`.", dragon_balance, 0.0
+
+    if amount <= 0:
+        return None, "Amount must be positive.", dragon_balance, 0.0
+
+    reserve = amount * float(price_per) if side == "buy" else 0.0
+    if side == "buy":
+        if dragon_balance is None:
+            return None, "Error fetching Dragon balance.", None, reserve
+        available = float(dragon_balance.get("mdragons", 0) or 0)
+        if reserve > available + 1e-9:
+            return None, f"Insufficient dragons. Available: **{format_dragon_amount_short(available)}**.", dragon_balance, reserve
+
+    return amount, None, dragon_balance, reserve
+
+
 async def post_order_for_discord_user(
     discord_id: int,
     item_type: str,
@@ -2090,9 +2450,7 @@ async def post_order_for_discord_user(
 ) -> tuple[bool, str, Optional[int]]:
     if amount <= 0 or price_per <= 0:
         return False, "Amount and price must be positive.", None
-    mc_uuid, err = await get_required_mc_uuid(discord_id)
-    if err:
-        return False, err, None
+    mc_uuid = dragon_account_uuid(discord_id)
 
     endpoint = "order/place_buy" if side == "buy" else "order/place"
     session = await get_http_session()
@@ -2108,9 +2466,7 @@ async def post_order_for_discord_user(
 
 
 async def cancel_order_for_discord_user(discord_id: int, order_id: int) -> tuple[bool, str]:
-    mc_uuid, err = await get_required_mc_uuid(discord_id)
-    if err:
-        return False, err
+    mc_uuid = dragon_account_uuid(discord_id)
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/order/cancel", json={"order_id": order_id, "mc_uuid": mc_uuid}) as r:
         if r.status != 200:
@@ -2119,9 +2475,7 @@ async def cancel_order_for_discord_user(discord_id: int, order_id: int) -> tuple
 
 
 async def cancel_all_orders_for_discord_user(discord_id: int, item: Optional[str] = None) -> tuple[bool, str, int]:
-    mc_uuid, err = await get_required_mc_uuid(discord_id)
-    if err:
-        return False, err, 0
+    mc_uuid = dragon_account_uuid(discord_id)
     payload: dict = {"mc_uuid": mc_uuid}
     if item:
         payload["item"] = item
@@ -2139,12 +2493,8 @@ async def give_dragons_for_discord_users(sender_id: int, recipient_id: int, amou
     if sender_id == recipient_id:
         return False, "Cannot give to yourself."
 
-    sender_uuid, err = await get_required_mc_uuid(sender_id)
-    if err:
-        return False, err
-    recipient_uuid, err = await get_required_mc_uuid(recipient_id)
-    if err:
-        return False, err
+    sender_uuid = dragon_account_uuid(sender_id)
+    recipient_uuid = dragon_account_uuid(recipient_id)
 
     session = await get_http_session()
     async with session.post(
@@ -2153,13 +2503,11 @@ async def give_dragons_for_discord_users(sender_id: int, recipient_id: int, amou
     ) as r:
         if r.status != 200:
             return False, (await r.json()).get("detail", "Transfer failed.")
-    return True, f"<@{sender_id}> sent **🐉 {amount:,}** to <@{recipient_id}>."
+    return True, f"<@{sender_id}> sent **ðŸ‰ {amount:,}** to <@{recipient_id}>."
 
 
 async def adjust_dragons_for_discord_user(discord_id: int, delta: int) -> tuple[bool, str]:
-    mc_uuid, err = await get_required_mc_uuid(discord_id)
-    if err:
-        return False, err
+    mc_uuid = dragon_account_uuid(discord_id)
     session = await get_http_session()
     async with session.post(
         f"{BASE_URL}/balance/adjust",
@@ -2225,7 +2573,7 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
         cmd = f"!{parts[1].lower()}"
         parts = [cmd] + parts[2:]
 
-    supported = {"!give", "!sell", "!buy", "!cancel", "!cancel_all", "!cancel-all"}
+    supported = {"!balance", "!give", "!sell", "!buy", "!cancel", "!cancel_all", "!cancel-all"}
     if cmd not in supported:
         return False
 
@@ -2234,6 +2582,29 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
         return True
 
     try:
+        if cmd == "!balance":
+            if allowed_bot_author:
+                if len(parts) != 2:
+                    await message.reply("Usage: `!balance <user_id>`", mention_author=False)
+                    return True
+                actor_id = parse_discord_id(parts[1])
+            else:
+                if len(parts) > 2:
+                    await message.reply("Usage: `!balance [user]`", mention_author=False)
+                    return True
+                actor_id = parse_discord_id(parts[1]) if len(parts) == 2 else message.author.id
+            if not actor_id:
+                await message.reply(embed=err_embed("Could not parse user id."), mention_author=False)
+                return True
+            mc_uuid = await get_mc_uuid(str(actor_id))
+            data = await fetch_economy_balance(mc_uuid or dragon_account_uuid(actor_id))
+            if data is None:
+                await message.reply(embed=err_embed("Error fetching balance."), mention_author=False)
+                return True
+            embed = build_economy_balance_embed(f"<@{actor_id}>", data, linked=mc_uuid is not None)
+            await message.reply(embed=embed, mention_author=False)
+            return True
+
         if cmd == "!give":
             if allowed_bot_author:
                 if len(parts) != 4:
@@ -2241,21 +2612,30 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
                     return True
                 sender_id = parse_discord_id(parts[1])
                 recipient_id = parse_discord_id(parts[2])
-                amount = int(parts[3])
+                amount_raw = parts[3]
             else:
                 if len(parts) != 3:
                     await message.reply("Usage: `!give <user> <amount>`", mention_author=False)
                     return True
                 sender_id = message.author.id
                 recipient_id = parse_discord_id(parts[1])
-                amount = int(parts[2])
+                amount_raw = parts[2]
             if not sender_id or not recipient_id:
                 await message.reply(embed=err_embed("Could not parse user id."), mention_author=False)
+                return True
+            amount, amount_err, balance = await resolve_dragon_amount(amount_raw, sender_id)
+            if amount_err or amount is None or balance is None:
+                await message.reply(embed=err_embed(amount_err or "Invalid amount."), mention_author=False)
+                return True
+            confirmed = await confirm_dragon_transfer_in_channel(
+                message.channel, sender_id, recipient_id, amount, balance
+            )
+            if not confirmed:
                 return True
             ok, msg = await give_dragons_for_discord_users(sender_id, recipient_id, amount)
             await message.reply(embed=ok_embed(msg) if ok else err_embed(msg), mention_author=False)
             if ok:
-                await log_transaction(message.guild, "🐉 Economy++ Give", msg, color=GREEN)
+                await log_transaction(message.guild, "ðŸ‰ Economy++ Give", msg, color=GREEN)
                 await update_mansa_musa(message.guild)
             return True
 
@@ -2276,14 +2656,29 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
             if not actor_id:
                 await message.reply(embed=err_embed("Could not parse user id."), mention_author=False)
                 return True
-            amount = int(amount_raw)
             price_per = float(price_raw)
+            amount, amount_err, dragon_balance, reserve = await resolve_market_order_amount(
+                actor_id, item_type, amount_raw, price_per, side
+            )
+            if amount_err or amount is None:
+                await message.reply(embed=err_embed(amount_err or "Invalid amount."), mention_author=False)
+                return True
+            if side == "buy" and dragon_balance is not None:
+                confirmed = await confirm_dragon_spend_in_channel(
+                    message.channel,
+                    actor_id,
+                    reserve,
+                    dragon_balance,
+                    f"placing a buy order for {amount}x {item_display(item_type)} at",
+                )
+                if not confirmed:
+                    return True
             ok, msg, order_id = await post_order_for_discord_user(actor_id, item_type, amount, price_per, side)
             if ok:
                 await message.reply(
                     embed=ok_embed(
                         f"{side.title()} order placed! Order ID: **#{order_id}**\n"
-                        f"{amount}x {item_display(item_type)} @ **🐉 {price_per:.2f}** each"
+                        f"{amount}x {item_display(item_type)} @ **ðŸ‰ {price_per:.2f}** each"
                     ),
                     mention_author=False,
                 )
@@ -2367,9 +2762,9 @@ ITEM_ALIASES = {
 _last_external_msg_id: Optional[int] = None
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # BACKGROUND TASKS (MDragons)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def _run_mechanics_tick():
     try:
         session = await get_http_session()
@@ -2380,13 +2775,13 @@ async def _run_mechanics_tick():
                     action = result.get("action")
                     role   = result.get("role")
                     if action == "reset":
-                        print(f"[mechanics] Reset → {role} | new status: {result.get('new_status')}")
+                        print(f"[mechanics] Reset â†’ {role} | new status: {result.get('new_status')}")
                     elif action == "ticked":
-                        print(f"[mechanics] Tick  → {role} | {result.get('item')} "
-                              f"@ {result.get('price')} 🐉  "
+                        print(f"[mechanics] Tick  â†’ {role} | {result.get('item')} "
+                              f"@ {result.get('price')} ðŸ‰  "
                               f"({result.get('week_progress_pct')}% through week)")
                     elif action == "paused":
-                        print(f"[mechanics] PAUSED → {role} | {result.get('item')} price movement skipped")
+                        print(f"[mechanics] PAUSED â†’ {role} | {result.get('item')} price movement skipped")
     except Exception:
         log.exception("[mechanics loop] tick failed")
 
@@ -2419,9 +2814,9 @@ async def deposit_log_loop():
         if not entries:
             return
         for e in entries:
-            action_word  = "📥 Deposited" if e["action"] == "deposit" else "📤 Withdrew"
+            action_word  = "ðŸ“¥ Deposited" if e["action"] == "deposit" else "ðŸ“¤ Withdrew"
             action_color = 0x00C853 if e["action"] == "deposit" else 0xFF6F00
-            mention = f"`{e['mc_uuid'][:8]}…`"
+            mention = f"`{e['mc_uuid'][:8]}â€¦`"
             try:
                 async with session.get(f"{BASE_URL}/discord_id/{e['mc_uuid']}") as r2:
                     if r2.status == 200:
@@ -2432,7 +2827,7 @@ async def deposit_log_loop():
                 log.warning("[deposit_log_loop] failed to resolve discord id for %s", e.get("mc_uuid"))
             item_label = item_display(e["item"])
             embed = discord.Embed(
-                title=f"{action_word} — {item_label}",
+                title=f"{action_word} â€” {item_label}",
                 color=action_color,
                 timestamp=datetime.fromisoformat(e["timestamp"]) if e.get("timestamp") else None
             )
@@ -2480,10 +2875,10 @@ async def order_event_log_loop():
             color = 0x1E90FF if event_type == "placed" else 0xFF6F00
             title = "Order Placed" if event_type == "placed" else "Order Cancelled"
             embed = discord.Embed(
-                title=f"📋  {title}",
+                title=f"ðŸ“‹  {title}",
                 description=(
                     f"{player} {event_type} **{side}** order **#{e.get('order_id')}**\n"
-                    f"**{e.get('amount')}x {item_label}** @ **🐉 {float(e.get('price_per') or 0):,.4f}** each"
+                    f"**{e.get('amount')}x {item_label}** @ **ðŸ‰ {float(e.get('price_per') or 0):,.4f}** each"
                 ),
                 color=color,
                 timestamp=datetime.fromisoformat(e["timestamp"]) if e.get("timestamp") else None,
@@ -2523,13 +2918,13 @@ async def trade_event_log_loop():
             seller = await resolve_mc_mention(session, str(e.get("seller_uuid") or ""))
             item_label = item_display(str(e.get("item") or ""))
             embed = discord.Embed(
-                title="✅  Trade Executed",
+                title="âœ…  Trade Executed",
                 description=(
                     f"Buyer: {buyer}\n"
                     f"Seller: {seller}\n"
                     f"Item: **{e.get('amount')}x {item_label}**\n"
-                    f"Price: **🐉 {float(e.get('price_per') or 0):,.4f}** each\n"
-                    f"Value: **🐉 {float(e.get('value') or 0):,.4f}**"
+                    f"Price: **ðŸ‰ {float(e.get('price_per') or 0):,.4f}** each\n"
+                    f"Value: **ðŸ‰ {float(e.get('value') or 0):,.4f}**"
                 ),
                 color=0x00C853,
                 timestamp=datetime.fromisoformat(e["timestamp"]) if e.get("timestamp") else None,
@@ -2663,13 +3058,7 @@ async def external_give_loop():
                 if not sender_id:
                     continue
 
-                async with session.get(f"{BASE_URL}/mc_uuid/{sender_id}") as r:
-                    if r.status != 200:
-                        log.info("[external_give] sender %s not linked — skipping", sender_id)
-                        continue
-                    mc_uuid = (await r.json()).get("mc_uuid")
-                if not mc_uuid:
-                    continue
+                mc_uuid = dragon_account_uuid(sender_id)
 
                 event_id = f"external_give:{msg.id}:{embed_index}"
                 async with session.post(
@@ -2687,7 +3076,7 @@ async def external_give_loop():
                 try:
                     if public_channel:
                         await public_channel.send(
-                            f"<@{sender_id}> exchanged **🐉 {amount:,}** from Economy:dragon: "
+                            f"<@{sender_id}> exchanged **ðŸ‰ {amount:,}** from Economy:dragon: "
                             f"into Economy++:dragon:."
                         )
                 except discord.Forbidden:
@@ -2696,10 +3085,10 @@ async def external_give_loop():
                 ch_log = guild.get_channel(TRANSACTION_LOG_CHANNEL_ID)
                 if ch_log:
                     log_embed = discord.Embed(
-                        title="💸  External Transfer Received",
+                        title="ðŸ’¸  External Transfer Received",
                         description=(
-                            f"<@{sender_id}> sent **{amount:,} UB** via Economy++ → "
-                            f"credited **🐉 {amount:,}** to their MDragons vault."
+                            f"<@{sender_id}> sent **{amount:,} UB** via Economy++ â†’ "
+                            f"credited **ðŸ‰ {amount:,}** to their MDragons vault."
                         ),
                         color=0x00C853
                     )
@@ -2708,7 +3097,7 @@ async def external_give_loop():
                     except discord.Forbidden:
                         pass
                 await update_mansa_musa(guild)
-                log.info("[external_give] +%s 🐉 credited to %s (Discord: %s)", amount, mc_uuid, sender_id)
+                log.info("[external_give] +%s ðŸ‰ credited to %s (Discord: %s)", amount, mc_uuid, sender_id)
 
     except Exception:
         log.exception("[external_give_loop] failed")
@@ -2719,9 +3108,9 @@ async def before_external_give_loop():
     await bot.wait_until_ready()
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # EVENTS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @bot.event
 async def on_ready():
     await get_http_session()
@@ -2790,7 +3179,7 @@ async def _boot_open_arena():
 
     view = ArenaView()
     embed = build_dashboard_embed(new_gid, new_date, pot, end_ts)
-    header = f"```ansi\n\u001b[1;32m▶ DAEMON ARENA {format_arena_display_id(new_date)}\u001b[0m\n```"
+    header = f"```ansi\n\u001b[1;32mâ–¶ DAEMON ARENA {format_arena_display_id(new_date)}\u001b[0m\n```"
     msg = await ch.send(content=header, embed=embed, view=view)
 
     set_arena(game_open=1, game_date=new_date, dashboard_msg=msg.id, pot=pot, cycle_start_ts=time.time(), game_id=new_gid, next_end_ts=end_ts)
@@ -2802,9 +3191,9 @@ async def _boot_open_arena():
     log.info(f"Boot convergence #{new_gid} opened. Ends at {end_dt}")
 
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — ECONOMY CATEGORY (MDragons)
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” ECONOMY CATEGORY (MDragons)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 economy = app_commands.Group(name="economy", description="MDragons economy commands")
 market_group = app_commands.Group(name="market", description="Market trading commands")
 lists_group = app_commands.Group(name="lists", description="Purchase list commands")
@@ -2824,28 +3213,16 @@ async def link(interaction: discord.Interaction, code: str):
                 await interaction.followup.send(embed=err_embed(detail), ephemeral=True)
 
 
-@economy.command(name="balance", description="View your vault balance (items + 🐉)")
+@economy.command(name="balance", description="View your vault balance (items + ðŸ‰)")
 async def economy_balance(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked. Use `/economy link` first."), ephemeral=True)
+    data = await fetch_economy_balance(mc_uuid or dragon_account_uuid(interaction.user.id))
+    if data is None:
+        await interaction.followup.send(embed=err_embed("Error fetching balance."), ephemeral=True)
         return
-    session = await get_http_session()
-    async with session.get(f"{BASE_URL}/balance/{mc_uuid}") as r:
-            if r.status != 200:
-                await interaction.followup.send(embed=err_embed("Error fetching balance."), ephemeral=True)
-                return
-            data = await r.json()
 
-    embed = discord.Embed(title="💰  Vault Balance", color=BLUE)
-    embed.add_field(name="Netherite Ingots",    value=f"**{data['netherite']}**",                              inline=True)
-    embed.add_field(name="Diamonds",             value=f"**{data['diamond']}**",                               inline=True)
-    embed.add_field(name="\u200b",               value="\u200b",                                               inline=True)
-    embed.add_field(name="🐉 Vault",             value=f"**🐉 {int(data['mdragons']):,}**",                    inline=True)
-    embed.add_field(name="🐉 Locked in orders",  value=f"**🐉 {int(data.get('mdragons_locked', 0)):,}**",      inline=True)
-    embed.add_field(name="🐉 Total",             value=f"**🐉 {int(data.get('mdragons_total', data['mdragons'])):,}**", inline=True)
-    embed.set_footer(text="Locked = 🐉 reserved in open buy orders  ·  Use /market sell or /market buy to trade")
+    embed = build_economy_balance_embed(f"<@{interaction.user.id}>", data, linked=mc_uuid is not None)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2878,8 +3255,8 @@ async def economy_leaderboard_cmd(interaction: discord.Interaction, item: str, p
         total_txt = format_decimal(e["total"], decimals=4)
         if is_dragons:
             locked = float(e.get("locked") or 0)
-            locked_txt = f" (locked: 🐉 {int(locked):,})" if locked > 0 else ""
-            rows.append(f"**#{e['rank']}**  {holder}  -  **🐉 {total_txt}**{locked_txt}")
+            locked_txt = f" (locked: ðŸ‰ {int(locked):,})" if locked > 0 else ""
+            rows.append(f"**#{e['rank']}**  {holder}  -  **ðŸ‰ {total_txt}**{locked_txt}")
         else:
             rows.append(f"**#{e['rank']}**  {holder}  -  **{total_txt}**")
 
@@ -3029,13 +3406,10 @@ async def economy_backup_cmd(interaction: discord.Interaction, reason: Optional[
     )
 
 
-@economy.command(name="give", description="Send 🐉 from your Economy++ vault to another user")
-@app_commands.describe(user="Recipient", amount="Amount of 🐉 to send")
-async def economy_give_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+@economy.command(name="give", description="Send ðŸ‰ from your Economy++ vault to another user")
+@app_commands.describe(user="Recipient", amount="Amount of ðŸ‰ to send, or `all`")
+async def economy_give_cmd(interaction: discord.Interaction, user: discord.Member, amount: str):
     await interaction.response.defer()
-    if amount <= 0:
-        await interaction.followup.send(embed=err_embed("Amount must be positive."))
-        return
     if user.id == interaction.user.id:
         await interaction.followup.send(embed=err_embed("Cannot give to yourself."))
         return
@@ -3043,38 +3417,45 @@ async def economy_give_cmd(interaction: discord.Interaction, user: discord.Membe
         await interaction.followup.send(embed=err_embed("Cannot give to a bot."))
         return
 
-    sender_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not sender_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked. Use `/economy link` first."))
-        return
-    recipient_uuid = await get_mc_uuid(str(user.id))
-    if not recipient_uuid:
-        await interaction.followup.send(embed=err_embed("Recipient has not linked their Minecraft account."))
+    amount_value, amount_err, balance = await resolve_dragon_amount(amount, interaction.user.id)
+    if amount_err or amount_value is None or balance is None:
+        await interaction.followup.send(embed=err_embed(amount_err or "Invalid amount."))
         return
 
-    session = await get_http_session()
-    async with session.post(
-        f"{BASE_URL}/give",
-        json={"sender_uuid": sender_uuid, "recipient_uuid": recipient_uuid, "amount": amount},
-    ) as r:
-        if r.status != 200:
-            detail = (await r.json()).get("detail", "Transfer failed.")
-            await interaction.followup.send(embed=err_embed(detail))
-            return
-        await r.json()
+    confirmed = await confirm_dragon_transfer_for_interaction(interaction, user.id, amount_value, balance)
+    if not confirmed:
+        return
+
+    ok, msg = await give_dragons_for_discord_users(interaction.user.id, user.id, amount_value)
+    if not ok:
+        await interaction.followup.send(embed=err_embed(msg))
+        return
 
     await interaction.followup.send(
-        embed=ok_embed(f"<@{interaction.user.id}> sent **🐉 {amount:,}** to <@{user.id}>.")
+        embed=ok_embed(f"<@{interaction.user.id}> sent **ðŸ‰ {amount_value:,}** to <@{user.id}>.")
     )
     await log_transaction(
         interaction.guild,
-        "🐉 Economy++ Give",
-        f"<@{interaction.user.id}> sent **🐉 {amount:,}** to <@{user.id}>.",
+        "ðŸ‰ Economy++ Give",
+        f"<@{interaction.user.id}> sent **ðŸ‰ {amount_value:,}** to <@{user.id}>.",
         color=GREEN,
     )
 
 
     await update_mansa_musa(interaction.guild)
+
+
+@economy.command(name="transfer_threshold", description="Set when Dragon sends require reaction confirmation")
+@app_commands.describe(percent="0 = always confirm, 100 = never confirm, default is 50")
+async def economy_transfer_threshold_cmd(interaction: discord.Interaction, percent: int):
+    if percent < 0 or percent > 100:
+        await interaction.response.send_message(embed=err_embed("Threshold must be between 0 and 100."), ephemeral=True)
+        return
+    set_dragon_transfer_threshold(interaction.user.id, float(percent))
+    await interaction.response.send_message(
+        embed=ok_embed(f"Dragon transfer confirmation threshold set to **{percent}%**."),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="add-dragons", description="[Admin] Add dragons to a user's Economy++ vault")
@@ -3090,13 +3471,10 @@ async def remove_dragons_cmd(interaction: discord.Interaction, user: discord.Mem
 
 
 @economy.command(name="inventory", description="Check how much of any item you own (vault + in market)")
-@app_commands.describe(item="Item key, e.g. netherite, diamond, iron, overworld_log, wool…")
+@app_commands.describe(item="Item key, e.g. netherite, diamond, iron, overworld_log, woolâ€¦")
 async def inventory_cmd(interaction: discord.Interaction, item: str):
     await interaction.response.defer(ephemeral=True)
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."), ephemeral=True)
-        return
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     session = await get_http_session()
     async with session.get(f"{BASE_URL}/inventory/{mc_uuid}/{item}") as r:
             if r.status != 200:
@@ -3107,9 +3485,9 @@ async def inventory_cmd(interaction: discord.Interaction, item: str):
 
     label  = item_display(item)
     embed  = discord.Embed(
-        title=f"🎒  Inventory  —  {label}",
+        title=f"ðŸŽ’  Inventory  â€”  {label}",
         description=(f"```\n  Total           {data['total']:>6}\n"
-                     f"  ─────────────────────\n"
+                     f"  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n"
                      f"  Available       {data['vault']:>6}\n"
                      f"  In market       {data['in_orders']:>6}\n```"),
         color=BLUE
@@ -3118,7 +3496,7 @@ async def inventory_cmd(interaction: discord.Interaction, item: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@economy.command(name="cashout", description=f"Unlock cashout roles by spending 🐉 (Tier 1: {CASHOUT_THRESHOLD_1:,} 🐉 | Tier 2: {CASHOUT_THRESHOLD_2:,} 🐉)")
+@economy.command(name="cashout", description=f"Unlock cashout roles by spending ðŸ‰ (Tier 1: {CASHOUT_THRESHOLD_1:,} ðŸ‰ | Tier 2: {CASHOUT_THRESHOLD_2:,} ðŸ‰)")
 async def cashout_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     user_id = interaction.user.id
@@ -3140,13 +3518,10 @@ async def cashout_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=err_embed("Could not find you in this server."), ephemeral=True)
         return
 
-    mc_uuid = await get_mc_uuid(str(user_id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked. Use `/economy link` first."), ephemeral=True)
-        return
+    dragon_uuid = dragon_account_uuid(user_id)
 
     session = await get_http_session()
-    async with session.get(f"{BASE_URL}/balance/{mc_uuid}") as r:
+    async with session.get(f"{BASE_URL}/balance/{dragon_uuid}") as r:
             if r.status != 200:
                 await interaction.followup.send(embed=err_embed("Error fetching balance."), ephemeral=True)
                 return
@@ -3176,20 +3551,20 @@ async def cashout_cmd(interaction: discord.Interaction):
     if vault_dragons < target_threshold:
         short = target_threshold - vault_dragons
         await interaction.followup.send(embed=err_embed(
-            f"Not enough 🐉 for **{target_label}**.\n"
-            f"Have: **🐉 {int(vault_dragons):,}**  ·  Need: **🐉 {target_threshold:,}**\n"
-            f"You're **{int(short):,} 🐉** short.\n\n"
-            f"Tiers:\n• Tier 1 — 🐉 {CASHOUT_THRESHOLD_1:,}\n• Tier 2 — 🐉 {CASHOUT_THRESHOLD_2:,}"
+            f"Not enough ðŸ‰ for **{target_label}**.\n"
+            f"Have: **ðŸ‰ {int(vault_dragons):,}**  Â·  Need: **ðŸ‰ {target_threshold:,}**\n"
+            f"You're **{int(short):,} ðŸ‰** short.\n\n"
+            f"Tiers:\nâ€¢ Tier 1 â€” ðŸ‰ {CASHOUT_THRESHOLD_1:,}\nâ€¢ Tier 2 â€” ðŸ‰ {CASHOUT_THRESHOLD_2:,}"
         ), ephemeral=True)
         return
 
     _cashout_cooldowns[user_id] = now
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/convert/to_ub",
-                          json={"mc_uuid": mc_uuid, "amount": target_threshold}) as r:
+                          json={"mc_uuid": dragon_uuid, "amount": target_threshold}) as r:
             if r.status != 200:
                 await interaction.followup.send(
-                    embed=err_embed("Failed to deduct 🐉. Please try again or contact support."), ephemeral=True)
+                    embed=err_embed("Failed to deduct ðŸ‰. Please try again or contact support."), ephemeral=True)
                 return
 
     try:
@@ -3200,21 +3575,21 @@ async def cashout_cmd(interaction: discord.Interaction):
         return
 
     embed = discord.Embed(
-        title=f"💸  {target_label} Unlocked!",
-        description=f"🎉 You've unlocked the **{target_label}** role!\n\n**🐉 {target_threshold:,}** deducted from your vault.",
+        title=f"ðŸ’¸  {target_label} Unlocked!",
+        description=f"ðŸŽ‰ You've unlocked the **{target_label}** role!\n\n**ðŸ‰ {target_threshold:,}** deducted from your vault.",
         color=GREEN
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
-    await log_transaction(guild, "💸 Cashout",
-        f"<@{user_id}> unlocked **{target_label}** — spent **🐉 {target_threshold:,}**", color=GREEN)
+    await log_transaction(guild, "ðŸ’¸ Cashout",
+        f"<@{user_id}> unlocked **{target_label}** â€” spent **ðŸ‰ {target_threshold:,}**", color=GREEN)
 
 
-@economy.command(name="mdragons", description=f"Redeem the special role for {MDRAGONS_REWARD:,} 🐉 added to your vault")
+@economy.command(name="mdragons", description=f"Redeem the special role for {MDRAGONS_REWARD:,} ðŸ‰ added to your vault")
 async def mdragons_cmd(interaction: discord.Interaction):
     await _mdragons_impl(interaction, required_role_id=MDRAGONS_ROLE_ID, reward=MDRAGONS_REWARD, label="mdragons")
 
 
-@economy.command(name="10mdragons", description=f"Redeem the 10× special role for {TEN_MDRAGONS_REWARD:,} 🐉 added to your vault")
+@economy.command(name="10mdragons", description=f"Redeem the 10Ã— special role for {TEN_MDRAGONS_REWARD:,} ðŸ‰ added to your vault")
 async def ten_mdragons_cmd(interaction: discord.Interaction):
     await _mdragons_impl(interaction, required_role_id=TEN_MDRAGONS_ROLE_ID, reward=TEN_MDRAGONS_REWARD, label="10mdragons")
 
@@ -3243,32 +3618,29 @@ async def _mdragons_impl(interaction: discord.Interaction, required_role_id: int
         return
 
     try:
-        await member.remove_roles(role, reason=f"Redeemed for {reward:,} 🐉 via /{label}")
+        await member.remove_roles(role, reason=f"Redeemed for {reward:,} ðŸ‰ via /{label}")
     except discord.Forbidden:
         await interaction.followup.send(embed=err_embed("Insufficient permissions to remove the role."), ephemeral=True)
         return
 
-    mc_uuid = await get_mc_uuid(str(user_id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked. Use `/economy link` first."), ephemeral=True)
-        return
+    dragon_uuid = dragon_account_uuid(user_id)
 
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/convert/to_vault",
-                          json={"mc_uuid": mc_uuid, "amount": reward}) as r:
+                          json={"mc_uuid": dragon_uuid, "amount": reward}) as r:
             if r.status != 200:
                 await interaction.followup.send(embed=err_embed("Failed to credit vault. Please contact support."), ephemeral=True)
                 return
 
     await interaction.followup.send(embed=ok_embed(
-        f"Role successfully redeemed. **🐉 {reward:,}** have been added to your vault."
+        f"Role successfully redeemed. **ðŸ‰ {reward:,}** have been added to your vault."
     ), ephemeral=True)
-    await log_transaction(interaction.guild, "🎁 Role Redeemed",
-        f"<@{user_id}> redeemed the **{label}** role → **🐉 {reward:,}** added to vault", color=GREEN)
+    await log_transaction(interaction.guild, "ðŸŽ Role Redeemed",
+        f"<@{user_id}> redeemed the **{label}** role â†’ **ðŸ‰ {reward:,}** added to vault", color=GREEN)
 
 
 @market_group.command(name="view", description="View the live order book for any item")
-@app_commands.describe(item="Item key, e.g. netherite, diamond, iron, coal, overworld_log, wool…",
+@app_commands.describe(item="Item key, e.g. netherite, diamond, iron, coal, overworld_log, woolâ€¦",
                        spread="Optional: group orders within this price range (e.g. 10) for wider view")
 async def market_cmd(interaction: discord.Interaction, item: str, spread: Optional[float] = None):
     await interaction.response.defer()
@@ -3291,15 +3663,15 @@ async def market_cmd(interaction: discord.Interaction, item: str, spread: Option
     def fmt_row(price: float, amt: int, cum: int, prefix: str) -> str:
         return f"{prefix} {price:>{PW},.2f}   {str(amt):>{AW}}   {str(cum):>{CW}}"
 
-    header  = f"  {'PRICE (🐉)':>{PW}}   {'AMOUNT':>{AW}}   {'CUMUL':>{CW}}"
-    divider = "  " + "─" * (BAR_W - 2)
+    header  = f"  {'PRICE (ðŸ‰)':>{PW}}   {'AMOUNT':>{AW}}   {'CUMUL':>{CW}}"
+    divider = "  " + "â”€" * (BAR_W - 2)
     lines: list[str] = []
 
     if asks:
         for level in reversed(asks):
             lines.append(fmt_row(level["price"], level["amount"], level["cumulative"], "-"))
     else:
-        lines.append(f"-  {'— no sell orders —':^{BAR_W - 4}}")
+        lines.append(f"-  {'â€” no sell orders â€”':^{BAR_W - 4}}")
 
     if asks and bids:
         sp      = asks[0]["price"] - bids[0]["price"]
@@ -3315,36 +3687,40 @@ async def market_cmd(interaction: discord.Interaction, item: str, spread: Option
         for level in bids:
             lines.append(fmt_row(level["price"], level["amount"], level["cumulative"], "+"))
     else:
-        lines.append(f"+  {'— no buy orders —':^{BAR_W - 4}}")
+        lines.append(f"+  {'â€” no buy orders â€”':^{BAR_W - 4}}")
 
-    spread_tag = f"  ·  spread: {spread}" if spread else ""
+    spread_tag = f"  Â·  spread: {spread}" if spread else ""
     book_block = (f"```diff\n{header}\n{divider}\n" + "\n".join(lines) + f"\n{divider}\n```")
-    embed = discord.Embed(title=f"📊  {item_label} Order Book{spread_tag}", description=book_block, color=BLUE)
-    embed.set_footer(text="Red = asks (sell)  ·  Green = bids (buy)  ·  /market buy to bid  ·  prices in 🐉")
+    embed = discord.Embed(title=f"ðŸ“Š  {item_label} Order Book{spread_tag}", description=book_block, color=BLUE)
+    embed.set_footer(text="Red = asks (sell)  Â·  Green = bids (buy)  Â·  /market buy to bid  Â·  prices in ðŸ‰")
     await interaction.followup.send(embed=embed)
 
 
 @market_group.command(name="sell", description="List vaulted items for sale")
-@app_commands.describe(item_type="Item key, e.g. netherite, diamond, iron, overworld_log, wool…",
-                       amount="Quantity to list", price_per="Price per unit in 🐉")
-async def place_sell_order(interaction: discord.Interaction, item_type: str, amount: int, price_per: float):
+@app_commands.describe(item_type="Item key, e.g. netherite, diamond, iron, overworld_log, woolâ€¦",
+                       amount="Quantity to list", price_per="Price per unit in ðŸ‰")
+async def place_sell_order(interaction: discord.Interaction, item_type: str, amount: str, price_per: float):
     await interaction.response.defer()
-    if amount <= 0 or price_per <= 0:
+    if price_per <= 0:
         await interaction.followup.send(embed=err_embed("Amount and price must be positive."))
         return
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."))
+    amount_value, amount_err, _, _ = await resolve_market_order_amount(
+        interaction.user.id, item_type, amount, price_per, "sell"
+    )
+    if amount_err or amount_value is None:
+        await interaction.followup.send(embed=err_embed(amount_err or "Invalid amount."))
         return
+    amount = str(amount_value)
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/order/place",
                           json={"mc_uuid": mc_uuid, "item": item_type,
-                                "amount": amount, "price_per": price_per}) as r:
+                                "amount": amount_value, "price_per": price_per}) as r:
             if r.status == 200:
                 data = await r.json()
                 await interaction.followup.send(embed=ok_embed(
                     f"Sell order placed! Order ID: **#{data['order_id']}**\n"
-                    f"{amount}× {item_display(item_type)} @ **🐉 {price_per:.2f}** each"
+                    f"{amount}Ã— {item_display(item_type)} @ **ðŸ‰ {price_per:.2f}** each"
                 ))
                 await update_netherite_overlord(interaction.guild)
                 await update_mansa_musa(interaction.guild)
@@ -3353,27 +3729,39 @@ async def place_sell_order(interaction: discord.Interaction, item_type: str, amo
 
 
 @market_group.command(name="buy", description="Place a limit buy order for any item (money is reserved)")
-@app_commands.describe(item_type="Item key, e.g. netherite, diamond, iron, overworld_log, wool…",
+@app_commands.describe(item_type="Item key, e.g. netherite, diamond, iron, overworld_log, woolâ€¦",
                        amount="Quantity to buy",
-                       price_per="Maximum price per unit in 🐉 you're willing to pay")
-async def place_buy_order(interaction: discord.Interaction, item_type: str, amount: int, price_per: float):
+                       price_per="Maximum price per unit in ðŸ‰ you're willing to pay")
+async def place_buy_order(interaction: discord.Interaction, item_type: str, amount: str, price_per: float):
     await interaction.response.defer()
-    if amount <= 0 or price_per <= 0:
+    if price_per <= 0:
         await interaction.followup.send(embed=err_embed("Amount and price must be positive."))
         return
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."))
+    amount_value, amount_err, dragon_balance, reserve = await resolve_market_order_amount(
+        interaction.user.id, item_type, amount, price_per, "buy"
+    )
+    if amount_err or amount_value is None or dragon_balance is None:
+        await interaction.followup.send(embed=err_embed(amount_err or "Invalid amount."))
         return
+    confirmed = await confirm_dragon_spend_for_interaction(
+        interaction,
+        reserve,
+        dragon_balance,
+        f"placing a buy order for {amount_value}x {item_display(item_type)} at",
+    )
+    if not confirmed:
+        return
+    amount = str(amount_value)
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/order/place_buy",
                           json={"mc_uuid": mc_uuid, "item": item_type,
-                                "amount": amount, "price_per": price_per}) as r:
+                                "amount": amount_value, "price_per": price_per}) as r:
             if r.status == 200:
                 data = await r.json()
                 await interaction.followup.send(embed=ok_embed(
                     f"Buy order placed! Order ID: **#{data['order_id']}**\n"
-                    f"{amount}× {item_display(item_type)} @ up to **🐉 {price_per:.2f}** each"
+                    f"{amount}Ã— {item_display(item_type)} @ up to **ðŸ‰ {price_per:.2f}** each"
                 ))
                 await update_netherite_overlord(interaction.guild)
                 await update_mansa_musa(interaction.guild)
@@ -3385,10 +3773,7 @@ async def place_buy_order(interaction: discord.Interaction, item_type: str, amou
 @app_commands.describe(page="Page number (10 orders per page)")
 async def list_orders(interaction: discord.Interaction, page: int = 1):
     await interaction.response.defer(ephemeral=True)
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."), ephemeral=True)
-        return
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     session = await get_http_session()
     async with session.get(f"{BASE_URL}/orders/user/{mc_uuid}") as r:
             if r.status != 200:
@@ -3399,7 +3784,7 @@ async def list_orders(interaction: discord.Interaction, page: int = 1):
     orders = data.get("orders", [])
     if not orders:
         await interaction.followup.send(
-            embed=discord.Embed(description="📭  You have no active orders.", color=BLUE), ephemeral=True)
+            embed=discord.Embed(description="ðŸ“­  You have no active orders.", color=BLUE), ephemeral=True)
         return
 
     per_page    = 10
@@ -3408,10 +3793,10 @@ async def list_orders(interaction: discord.Interaction, page: int = 1):
     chunk       = orders[(page - 1) * per_page : page * per_page]
 
     W   = {"side": 6, "id": 5, "item": 9, "qty": 7, "price": 10, "total": 12}
-    sep = "  " + "─" * (sum(W.values()) + len(W) * 3 + 1)
+    sep = "  " + "â”€" * (sum(W.values()) + len(W) * 3 + 1)
     hdr = (f"  {'SIDE':<{W['side']}}   {'#':>{W['id']}}   "
            f"{'ITEM':<{W['item']}}   {'QTY':>{W['qty']}}   "
-           f"{'PRICE/U':>{W['price']}}   {'TOTAL 🐉':>{W['total']}}")
+           f"{'PRICE/U':>{W['price']}}   {'TOTAL ðŸ‰':>{W['total']}}")
     rows = []
     for o in chunk:
         iname    = item_display(o["item"])[:9]
@@ -3422,8 +3807,8 @@ async def list_orders(interaction: discord.Interaction, page: int = 1):
             f"{o['remaining']:>{W['qty']}}   {o['price_per']:>{W['price']}.2f}   {total:>{W['total']}.2f}"
         )
     block = "```\n" + hdr + "\n" + sep + "\n" + "\n".join(rows) + "\n" + sep + "\n```"
-    embed = discord.Embed(title="📋  Your Active Orders", description=block, color=BLUE)
-    embed.set_footer(text=f"Page {page} / {total_pages}  ·  {len(orders)} total  ·  prices in 🐉")
+    embed = discord.Embed(title="ðŸ“‹  Your Active Orders", description=block, color=BLUE)
+    embed.set_footer(text=f"Page {page} / {total_pages}  Â·  {len(orders)} total  Â·  prices in ðŸ‰")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3431,10 +3816,7 @@ async def list_orders(interaction: discord.Interaction, page: int = 1):
 @app_commands.describe(order_id="Order ID to cancel")
 async def cancel_order_cmd(interaction: discord.Interaction, order_id: int):
     await interaction.response.defer()
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."))
-        return
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     session = await get_http_session()
     async with session.post(f"{BASE_URL}/order/cancel",
                           json={"order_id": order_id, "mc_uuid": mc_uuid}) as r:
@@ -3446,13 +3828,10 @@ async def cancel_order_cmd(interaction: discord.Interaction, order_id: int):
 
 
 @market_group.command(name="cancel_all", description="Cancel all (or all of one item's) orders")
-@app_commands.describe(item="Optional: item key to cancel (e.g. netherite, iron, wool) — leave blank for all")
+@app_commands.describe(item="Optional: item key to cancel (e.g. netherite, iron, wool) â€” leave blank for all")
 async def cancel_all_orders_cmd(interaction: discord.Interaction, item: Optional[str] = None):
     await interaction.response.defer()
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Account not linked."))
-        return
+    mc_uuid = dragon_account_uuid(interaction.user.id)
     payload: dict = {"mc_uuid": mc_uuid}
     if item:
         payload["item"] = item
@@ -3479,34 +3858,34 @@ async def mechanics_status_cmd(interaction: discord.Interaction):
                 return
             data = await r.json()
 
-    embed = discord.Embed(title="⚙️  Market Mechanics Status", color=BLUE)
+    embed = discord.Embed(title="âš™ï¸  Market Mechanics Status", color=BLUE)
     embed.add_field(
-        name="🗓️ Weekly Reset",
+        name="ðŸ—“ï¸ Weekly Reset",
         value=f"Last: `{data['last_reset'][:16]}`\nNext: `{data['next_reset'][:16]}`",
         inline=False
     )
     if data.get("injection_paused"):
-        embed.add_field(name="⏸️ Injection Paused", value="Liquidity injection is currently **paused** by an admin.", inline=False)
+        embed.add_field(name="â¸ï¸ Injection Paused", value="Liquidity injection is currently **paused** by an admin.", inline=False)
 
     for m in data.get("mechanisms", []):
-        role_label  = "👑 Mansa Musa" if m["role"] == "MANSA_MUSA" else "🐉 Netherite Overlord"
+        role_label  = "ðŸ‘‘ Mansa Musa" if m["role"] == "MANSA_MUSA" else "ðŸ‰ Netherite Overlord"
         status      = m["status"]
-        item        = m.get("current_item") or "—"
+        item        = m.get("current_item") or "â€”"
         pending     = m.get("pending_item")
         filled      = int(m.get("weekly_value_filled", 0))
         target      = int(m.get("weekly_target", 0))
         pct         = m.get("threshold_pct", 0)
-        price_line  = f"\nCurrent price: **🐉 {m['current_price']:,.2f}**" if "current_price" in m else ""
-        prog_line   = f"\nProgress: **🐉 {filled:,} / {target:,}** ({pct}%)" if status == "active" else ""
-        pending_line = f"\n⏳ Pending: **{pending}** (next reset)" if pending else ""
-        status_emoji = {"active": "🟢", "frozen": "🔴", "inactive": "⚫", "announced": "🟡"}.get(status, "❔")
+        price_line  = f"\nCurrent price: **ðŸ‰ {m['current_price']:,.2f}**" if "current_price" in m else ""
+        prog_line   = f"\nProgress: **ðŸ‰ {filled:,} / {target:,}** ({pct}%)" if status == "active" else ""
+        pending_line = f"\nâ³ Pending: **{pending}** (next reset)" if pending else ""
+        status_emoji = {"active": "ðŸŸ¢", "frozen": "ðŸ”´", "inactive": "âš«", "announced": "ðŸŸ¡"}.get(status, "â”")
         embed.add_field(
             name=f"{role_label}  {status_emoji} {status.upper()}",
             value=f"Market: **{item}**{price_line}{prog_line}{pending_line}",
             inline=False
         )
 
-    embed.set_footer(text=f"Injection cap: 🐉 {int(data.get('weekly_target', 0)):,}  ·  Resets every Saturday 21:00 CET")
+    embed.set_footer(text=f"Injection cap: ðŸ‰ {int(data.get('weekly_target', 0)):,}  Â·  Resets every Saturday 21:00 CET")
     await interaction.followup.send(embed=embed)
 
 
@@ -3544,22 +3923,22 @@ async def choose_market(interaction: discord.Interaction, item: str):
     activates_str = data['activates_at'][:10]
 
     embed = discord.Embed(
-        title="🔒  Liquidity Injection Locked In",
+        title="ðŸ”’  Liquidity Injection Locked In",
         description=(
             f"**{role_name}** has chosen to inject liquidity from the server into the **{item_label}** market.\n\n"
             f"Activates: **{activates_str} at 21:00 German time**\n\n"
-            f"⚠️ This choice is **permanent** — it cannot be changed until after that reset fires."
+            f"âš ï¸ This choice is **permanent** â€” it cannot be changed until after that reset fires."
         ),
         color=GREEN
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     public_embed = discord.Embed(
-        title="📢  Liquidity Injection Announced",
+        title="ðŸ“¢  Liquidity Injection Announced",
         description=(
             f"**{role_name}** will be injecting liquidity from the server into the **{item_label}** market.\n\n"
-            f"🗓️ Activates: **{activates_str} at 21:00 German time**\n"
-            f"🔒 This choice is locked in and cannot be changed before the reset."
+            f"ðŸ—“ï¸ Activates: **{activates_str} at 21:00 German time**\n"
+            f"ðŸ”’ This choice is locked in and cannot be changed before the reset."
         ),
         color=GREEN
     )
@@ -3573,7 +3952,7 @@ async def choose_market(interaction: discord.Interaction, item: str):
                     pass
 
 
-@market_group.command(name="set_injection_cap", description="(Chairman) Raise or lower the weekly liquidity injection cap by 50,000 🐉")
+@market_group.command(name="set_injection_cap", description="(Chairman) Raise or lower the weekly liquidity injection cap by 50,000 ðŸ‰")
 @app_commands.describe(direction="raise or lower")
 async def set_injection_cap(interaction: discord.Interaction, direction: str):
     await interaction.response.defer(ephemeral=True)
@@ -3596,14 +3975,14 @@ async def set_injection_cap(interaction: discord.Interaction, direction: str):
                 await interaction.followup.send(embed=err_embed(data.get("detail", "Failed.")), ephemeral=True)
                 return
 
-    arrow = "📈" if delta > 0 else "📉"
+    arrow = "ðŸ“ˆ" if delta > 0 else "ðŸ“‰"
     embed = discord.Embed(
         title=f"{arrow}  Injection Cap Updated",
         description=(
-            f"Current live cap: **🐉 {int(data['current_active_target']):,}**\n"
-            f"Previous pending cap: **🐉 {int(data['previous_pending_target']):,}**\n"
-            f"New pending cap: **🐉 {int(data['new_pending_target']):,}**\n\n"
-            f"Allowed range: 🐉 {int(data['min']):,} – 🐉 {int(data['max']):,}\n"
+            f"Current live cap: **ðŸ‰ {int(data['current_active_target']):,}**\n"
+            f"Previous pending cap: **ðŸ‰ {int(data['previous_pending_target']):,}**\n"
+            f"New pending cap: **ðŸ‰ {int(data['new_pending_target']):,}**\n\n"
+            f"Allowed range: ðŸ‰ {int(data['min']):,} â€“ ðŸ‰ {int(data['max']):,}\n"
             f"Activates at next reset: **{data['activates_at'][:16]}**\n"
             f"You may adjust again after the next weekly reset (Saturday 21:00 German time)."
         ),
@@ -3612,8 +3991,8 @@ async def set_injection_cap(interaction: discord.Interaction, direction: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
     await log_transaction(interaction.guild, f"{arrow} Injection Cap Adjusted",
         f"Chairman <@{interaction.user.id}> changed the pending weekly injection cap: "
-        f"**🐉 {int(data['previous_pending_target']):,}** → **🐉 {int(data['new_pending_target']):,}**"
-        f" (live cap remains **🐉 {int(data['current_active_target']):,}** until reset)",
+        f"**ðŸ‰ {int(data['previous_pending_target']):,}** â†’ **ðŸ‰ {int(data['new_pending_target']):,}**"
+        f" (live cap remains **ðŸ‰ {int(data['current_active_target']):,}** until reset)",
         color=GREEN if delta > 0 else RED)
 
 
@@ -3637,19 +4016,19 @@ async def injection_cap_range_cmd(interaction: discord.Interaction, minimum: int
             return
 
     embed = discord.Embed(
-        title="📏  Injection Cap Range Updated",
+        title="ðŸ“  Injection Cap Range Updated",
         description=(
-            f"New allowed range: **🐉 {int(data['min']):,} – {int(data['max']):,}**\n"
-            f"Current live cap: **🐉 {int(data['weekly_target']):,}**\n"
-            f"Pending next cap: **🐉 {int(data.get('weekly_target_pending', data['weekly_target'])):,}**"
+            f"New allowed range: **ðŸ‰ {int(data['min']):,} â€“ {int(data['max']):,}**\n"
+            f"Current live cap: **ðŸ‰ {int(data['weekly_target']):,}**\n"
+            f"Pending next cap: **ðŸ‰ {int(data.get('weekly_target_pending', data['weekly_target'])):,}**"
         ),
         color=GREEN,
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
     await log_transaction(
         interaction.guild,
-        "📏 Injection Cap Range Updated",
-        f"Chairman <@{interaction.user.id}> set the weekly injection cap range to **🐉 {int(data['min']):,} – {int(data['max']):,}**. Current live cap: **🐉 {int(data['weekly_target']):,}**. Pending next cap: **🐉 {int(data.get('weekly_target_pending', data['weekly_target'])):,}**",
+        "ðŸ“ Injection Cap Range Updated",
+        f"Chairman <@{interaction.user.id}> set the weekly injection cap range to **ðŸ‰ {int(data['min']):,} â€“ {int(data['max']):,}**. Current live cap: **ðŸ‰ {int(data['weekly_target']):,}**. Pending next cap: **ðŸ‰ {int(data.get('weekly_target_pending', data['weekly_target'])):,}**",
         color=GREEN,
     )
 
@@ -3675,7 +4054,7 @@ async def pause_injection_cmd(interaction: discord.Interaction, action: str):
                 await interaction.followup.send(embed=err_embed(data.get("detail", "Failed.")), ephemeral=True)
                 return
 
-    status_word = "⏸️ PAUSED" if should_pause else "▶️ RESUMED"
+    status_word = "â¸ï¸ PAUSED" if should_pause else "â–¶ï¸ RESUMED"
     color       = RED if should_pause else GREEN
     embed = discord.Embed(
         title=f"Liquidity Injection {status_word}",
@@ -3695,7 +4074,7 @@ async def pause_injection_cmd(interaction: discord.Interaction, action: str):
             if ch:
                 try:
                     await ch.send(embed=discord.Embed(
-                        title=f"⚠️ Liquidity Injection {status_word}",
+                        title=f"âš ï¸ Liquidity Injection {status_word}",
                         description=f"Liquidity injection has been **{'paused' if should_pause else 'resumed'}** by an administrator.",
                         color=color
                     ))
@@ -3703,18 +4082,18 @@ async def pause_injection_cmd(interaction: discord.Interaction, action: str):
                     pass
 
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — MARKET CATEGORY
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” MARKET CATEGORY
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — PURCHASE LISTS CATEGORY
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” PURCHASE LISTS CATEGORY
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 @lists_group.command(name="create", description="Create a purchase list (up to 5). Others can instantly sell you all items at your price.")
 @app_commands.describe(name="A short label for this list (e.g. 'Diamond bulk')",
-                       price="Total 🐉 you will pay when someone fills this list",
+                       price="Total ðŸ‰ you will pay when someone fills this list",
                        items="Items and quantities, e.g: diamond:100,netherite:5")
 async def create_purchase_list(interaction: discord.Interaction, name: str, price: float, items: str):
     await interaction.response.defer(ephemeral=True)
@@ -3732,15 +4111,15 @@ async def create_purchase_list(interaction: discord.Interaction, name: str, pric
                 return
 
     item_lines = "\n".join(
-        f"  • {qty}× {'Netherite Ingots' if k == 'NETHERITE_INGOT' else 'Diamonds'}"
+        f"  â€¢ {qty}Ã— {'Netherite Ingots' if k == 'NETHERITE_INGOT' else 'Diamonds'}"
         for k, qty in data["items"].items()
     )
     embed = discord.Embed(
-        title="📋  Purchase List Created",
+        title="ðŸ“‹  Purchase List Created",
         description=(
-            f"**{data['name']}**  ·  ID `#{data['list_id']}`\n\n"
+            f"**{data['name']}**  Â·  ID `#{data['list_id']}`\n\n"
             f"{item_lines}\n\n"
-            f"Total payout: **🐉 {int(data['price']):,}**\n\n"
+            f"Total payout: **ðŸ‰ {int(data['price']):,}**\n\n"
             f"Anyone with all these items can use `/lists fill {data['list_id']}` to instantly sell them to you."
         ),
         color=GREEN
@@ -3763,21 +4142,21 @@ async def my_purchase_lists(interaction: discord.Interaction):
     lists = data.get("lists", [])
     if not lists:
         await interaction.followup.send(
-            embed=discord.Embed(description="📭  You have no active purchase lists.", color=BLUE), ephemeral=True)
+            embed=discord.Embed(description="ðŸ“­  You have no active purchase lists.", color=BLUE), ephemeral=True)
         return
 
-    embed = discord.Embed(title="📋  Your Purchase Lists", color=BLUE)
+    embed = discord.Embed(title="ðŸ“‹  Your Purchase Lists", color=BLUE)
     for pl in lists:
         item_str = ", ".join(
-            f"{qty}× {'Netherite' if k == 'NETHERITE_INGOT' else 'Diamond'}"
+            f"{qty}Ã— {'Netherite' if k == 'NETHERITE_INGOT' else 'Diamond'}"
             for k, qty in pl["items"].items()
         )
         embed.add_field(
             name=f"#{pl['id']}  {pl['name']}",
-            value=f"{item_str}\n💰 **🐉 {int(pl['price']):,}** total payout",
+            value=f"{item_str}\nðŸ’° **ðŸ‰ {int(pl['price']):,}** total payout",
             inline=False
         )
-    embed.set_footer(text=f"{len(lists)}/5 slots used  ·  /lists delete <id> to remove one")
+    embed.set_footer(text=f"{len(lists)}/5 slots used  Â·  /lists delete <id> to remove one")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3790,22 +4169,22 @@ async def all_purchase_lists(interaction: discord.Interaction):
 
     lists = data.get("lists", [])
     if not lists:
-        await interaction.followup.send(embed=discord.Embed(description="📭  No purchase lists open right now.", color=BLUE))
+        await interaction.followup.send(embed=discord.Embed(description="ðŸ“­  No purchase lists open right now.", color=BLUE))
         return
 
     embed = discord.Embed(
-        title="🛒  Open Purchase Lists",
-        description="Use `/lists fill <id>` to instantly sell all items and collect the 🐉 payout.",
+        title="ðŸ›’  Open Purchase Lists",
+        description="Use `/lists fill <id>` to instantly sell all items and collect the ðŸ‰ payout.",
         color=BLUE
     )
     for pl in lists:
         item_str = ", ".join(
-            f"{qty}× {'Netherite' if k == 'NETHERITE_INGOT' else 'Diamond'}"
+            f"{qty}Ã— {'Netherite' if k == 'NETHERITE_INGOT' else 'Diamond'}"
             for k, qty in pl["items"].items()
         )
         embed.add_field(
             name=f"#{pl['id']}  {pl['name']}",
-            value=f"{item_str}\n💰 **🐉 {int(pl['price']):,}**  ·  buyer: <@!{pl['owner_uuid']}>",
+            value=f"{item_str}\nðŸ’° **ðŸ‰ {int(pl['price']):,}**  Â·  buyer: <@!{pl['owner_uuid']}>",
             inline=False
         )
     embed.set_footer(text=f"{len(lists)} list(s) open")
@@ -3831,7 +4210,7 @@ async def delete_purchase_list(interaction: discord.Interaction, list_id: int):
                 await interaction.followup.send(embed=err_embed(detail), ephemeral=True)
 
 
-@lists_group.command(name="fill", description="Instantly sell all items on a purchase list and receive the 🐉 payout")
+@lists_group.command(name="fill", description="Instantly sell all items on a purchase list and receive the ðŸ‰ payout")
 @app_commands.describe(list_id="ID of the purchase list to fill")
 async def fill_purchase_list(interaction: discord.Interaction, list_id: int):
     await interaction.response.defer()
@@ -3849,29 +4228,29 @@ async def fill_purchase_list(interaction: discord.Interaction, list_id: int):
                 return
 
     item_lines = "\n".join(
-        f"  • {qty}× {'Netherite Ingots' if k == 'NETHERITE_INGOT' else 'Diamonds'}"
+        f"  â€¢ {qty}Ã— {'Netherite Ingots' if k == 'NETHERITE_INGOT' else 'Diamonds'}"
         for k, qty in data["items"].items()
     )
     embed = discord.Embed(
-        title="✅  Purchase List Filled!",
+        title="âœ…  Purchase List Filled!",
         description=(
             f"**{data['list_name']}** has been filled.\n\n"
             f"{item_lines}\n\n"
-            f"You received: **🐉 {int(data['price_paid']):,}**"
+            f"You received: **ðŸ‰ {int(data['price_paid']):,}**"
         ),
         color=GREEN
     )
     await interaction.followup.send(embed=embed)
     await update_netherite_overlord(interaction.guild)
     await update_mansa_musa(interaction.guild)
-    await log_transaction(interaction.guild, "🛒 Purchase List Filled",
-        f"<@{interaction.user.id}> filled **{data['list_name']}** and received **🐉 {int(data['price_paid']):,}**",
+    await log_transaction(interaction.guild, "ðŸ›’ Purchase List Filled",
+        f"<@{interaction.user.id}> filled **{data['list_name']}** and received **ðŸ‰ {int(data['price_paid']):,}**",
         color=GREEN)
 
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — DAEMON CATEGORY
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” DAEMON CATEGORY
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 daemon_group = app_commands.Group(name="daemon", description="Daemon cryptocurrency commands")
 
 
@@ -3885,7 +4264,7 @@ async def i_am_satoshi_nakamoto_cmd(interaction: discord.Interaction, answer: st
     await interaction.response.defer(ephemeral=True)
     role = interaction.guild.get_role(SATOSHI_NAKAMOTO_ROLE_ID) if interaction.guild else None
     if not role:
-        await interaction.followup.send("❌ Satoshi role not found on this server.", ephemeral=True)
+        await interaction.followup.send("âŒ Satoshi role not found on this server.", ephemeral=True)
         return
 
     if answer == "no":
@@ -3896,18 +4275,18 @@ async def i_am_satoshi_nakamoto_cmd(interaction: discord.Interaction, answer: st
         if member and role in member.roles:
             await member.remove_roles(role, reason="Satoshi Nakamoto claim toggled off")
         await update_satoshi_role(interaction.guild)
-        await interaction.followup.send("✅ Satoshi Nakamoto claim removed.", ephemeral=True)
+        await interaction.followup.send("âœ… Satoshi Nakamoto claim removed.", ephemeral=True)
         return
 
     top_id = get_top_daemon_holder()
     if top_id != interaction.user.id:
         await update_satoshi_role(interaction.guild)
-        await interaction.followup.send("❌ Only the current top DAEMON holder can claim this role.", ephemeral=True)
+        await interaction.followup.send("âŒ Only the current top DAEMON holder can claim this role.", ephemeral=True)
         return
 
     set_daemon_market_meta("satoshi_claim_user_id", str(interaction.user.id))
     await update_satoshi_role(interaction.guild)
-    await interaction.followup.send("✅ Satoshi Nakamoto claim active while you remain the top DAEMON holder.", ephemeral=True)
+    await interaction.followup.send("âœ… Satoshi Nakamoto claim active while you remain the top DAEMON holder.", ephemeral=True)
 
 
 @daemon_group.command(name="balance", description="Check your Daemon balance (private)")
@@ -3920,52 +4299,76 @@ async def daemon_balance_cmd(interaction: discord.Interaction):
 @daemon_group.command(name="send", description="Transfer Daemon to another user")
 @app_commands.describe(
     user="Recipient",
-    amount="Amount to send",
+    amount="Amount to send, or `all`",
     hidden="Send anonymously (true = anonymous, false = public)",
     message="Optional message to include with the transfer",
 )
 async def daemon_send_cmd(
     interaction: discord.Interaction,
     user: discord.Member,
-    amount: int,
+    amount: str,
     hidden: bool = False,
     message: Optional[str] = None,
 ):
-    if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    bal = get_balance(interaction.user.id)
+    amount_value = bal if amount.strip().lower() == "all" else parse_whole_amount(amount)
+    if amount_value is None or amount_value <= 0:
+        await interaction.followup.send(embed=err_embed("Amount must be a positive whole number or `all`."), ephemeral=True)
         return
     if user.id == interaction.user.id:
-        await interaction.response.send_message("❌ Cannot send to yourself.", ephemeral=True)
+        await interaction.followup.send(embed=err_embed("Cannot send to yourself."), ephemeral=True)
         return
 
-    bal = get_balance(interaction.user.id)
-    if bal < amount:
-        await interaction.response.send_message(
-            f"❌ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}", ephemeral=True)
+    if bal < amount_value:
+        await interaction.followup.send(
+            embed=err_embed(f"Insufficient balance: `{bal:,}` {DAEMON_EMOJI}"), ephemeral=True)
+        return
+
+    confirmed = await confirm_daemon_spend_for_interaction(
+        interaction,
+        amount_value,
+        "sending DAEMON",
+        prefer_dm=hidden,
+    )
+    if not confirmed:
         return
 
     txid   = gen_txid()
 
-    add_balance(interaction.user.id, -amount)
-    add_balance(user.id, amount)
+    add_balance(interaction.user.id, -amount_value)
+    add_balance(user.id, amount_value)
 
     sender_bal = get_balance(interaction.user.id)
     recip_bal  = get_balance(user.id)
 
-    sender_embed = build_tx_sender_embed(user, amount, txid, hidden, sender_bal, message)
-    await interaction.response.send_message(embed=sender_embed, ephemeral=True)
+    sender_embed = build_tx_sender_embed(user, amount_value, txid, hidden, sender_bal, message)
+    await interaction.followup.send(embed=sender_embed, ephemeral=True)
 
     try:
-        recip_embed = build_tx_recipient_embed(interaction.user, amount, txid, hidden, recip_bal, message)
+        recip_embed = build_tx_recipient_embed(interaction.user, amount_value, txid, hidden, recip_bal, message)
         await user.send(embed=recip_embed)
     except Exception:
         pass
 
     log_ch = bot.get_channel(TRANSACTION_CHANNEL)
     if log_ch and not hidden:
-        log_embed = build_tx_log_embed(interaction.user, user, amount, txid, hidden, message)
+        log_embed = build_tx_log_embed(interaction.user, user, amount_value, txid, hidden, message)
         await log_ch.send(embed=log_embed)
     await update_satoshi_role(interaction.guild)
+
+
+@daemon_group.command(name="transfer_threshold", description="Set when DAEMON sends/orders require reaction confirmation")
+@app_commands.describe(percent="0 = always confirm, 100 = never confirm, default is 50")
+async def daemon_transfer_threshold_cmd(interaction: discord.Interaction, percent: int):
+    if percent < 0 or percent > 100:
+        await interaction.response.send_message(embed=err_embed("Threshold must be between 0 and 100."), ephemeral=True)
+        return
+    set_daemon_transfer_threshold(interaction.user.id, float(percent))
+    await interaction.response.send_message(
+        embed=ok_embed(f"DAEMON confirmation threshold set to **{percent}%**."),
+        ephemeral=True,
+    )
 
 
 @daemon_group.command(name="stats", description="View the Daemon economy stats (public)")
@@ -3973,7 +4376,7 @@ async def daemon_stats_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_daemon_info_embed())
 
 
-@daemon_group.command(name="info", description="Learn how Daemon works — full guide")
+@daemon_group.command(name="info", description="Learn how Daemon works â€” full guide")
 async def daemon_info_cmd(interaction: discord.Interaction):
     G = "\u001b[1;32m"; g = "\u001b[0;32m"; C = "\u001b[1;36m"
     W = "\u001b[0;37m"; Y = "\u001b[0;33m"; D = "\u001b[0;90m"
@@ -3981,53 +4384,53 @@ async def daemon_info_cmd(interaction: discord.Interaction):
 
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║     D A E M O N   —   H O W   T O        ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘     D A E M O N   â€”   H O W   T O        â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{C}  ┌─ WHAT IS DAEMON? ──────────────────────┐{R}",
-        f"{W}  │  DAEMON is a capped in-server currency  │{R}",
-        f"{W}  │  (max {MAX_SUPPLY:,}) inspired by Bitcoin. │{R}",
-        f"{W}  │  You earn it, send it, and pledge it.   │{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ WHAT IS DAEMON? â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  DAEMON is a capped in-server currency  â”‚{R}",
+        f"{W}  â”‚  (max {MAX_SUPPLY:,}) inspired by Bitcoin. â”‚{R}",
+        f"{W}  â”‚  You earn it, send it, and pledge it.   â”‚{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{C}  ┌─ THE ARENA ─────────────────────────────┐{R}",
-        f"{W}  │  Each day a convergence opens. Commit DAEMON    │{R}",
-        f"{W}  │  to Rock, Paper, or Scissors.            │{R}",
-        f"{W}  │  Convergences resolve once daily at an unpredictable time  │{R}",
-        f"{W}  │  (the exact moment is unknown until it arrives).      │{R}",
-        f"{W}  │  • Underdog pool wins half the emission  │{R}",
-        f"{W}  │  • Biggest pool fights 2nd place (RPS)   │{R}",
-        f"{W}  │  • Winner of that fight wins other half  │{R}",
-        f"{W}  │  • Winners also earn a share of mined    │{R}",
-        f"{W}  │    DAEMON from that day's emission       │{R}",
-        f"{W}  │  • Min pledge: 1 DAEMON                  │{R}",
-        f"{W}  │  • Pool sizes hidden until reveal        │{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ THE ARENA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  Each day a convergence opens. Commit DAEMON    â”‚{R}",
+        f"{W}  â”‚  to Rock, Paper, or Scissors.            â”‚{R}",
+        f"{W}  â”‚  Convergences resolve once daily at an unpredictable time  â”‚{R}",
+        f"{W}  â”‚  (the exact moment is unknown until it arrives).      â”‚{R}",
+        f"{W}  â”‚  â€¢ Underdog pool wins half the emission  â”‚{R}",
+        f"{W}  â”‚  â€¢ Biggest pool fights 2nd place (RPS)   â”‚{R}",
+        f"{W}  â”‚  â€¢ Winner of that fight wins other half  â”‚{R}",
+        f"{W}  â”‚  â€¢ Winners also earn a share of mined    â”‚{R}",
+        f"{W}  â”‚    DAEMON from that day's emission       â”‚{R}",
+        f"{W}  â”‚  â€¢ Min pledge: 1 DAEMON                  â”‚{R}",
+        f"{W}  â”‚  â€¢ Pool sizes hidden until reveal        â”‚{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{C}  ┌─ PAYOUT DISTRIBUTION ───────────────────┐{R}",
-        f"{W}  │  Within a winning pool, rewards are NOT  │{R}",
-        f"{W}  │  split evenly. Your share is proportional│{R}",
-        f"{W}  │  to your stake^1.5 (power 1.5).          │{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ PAYOUT DISTRIBUTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  Within a winning pool, rewards are NOT  â”‚{R}",
+        f"{W}  â”‚  split evenly. Your share is proportionalâ”‚{R}",
+        f"{W}  â”‚  to your stake^1.5 (power 1.5).          â”‚{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{C}  ┌─ EMISSION & HALVING ────────────────────┐{R}",
-        f"{W}  │  Starts at {INITIAL_DAILY:,}/day. After {HALVING_THRESHOLD:,}      │{R}",
-        f"{W}  │  DAEMON minted the rate drops by 10%.   │{R}",
-        f"{W}  │  Then drops 10% every year until cap.   │{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ EMISSION & HALVING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{W}  â”‚  Starts at {INITIAL_DAILY:,}/day. After {HALVING_THRESHOLD:,}      â”‚{R}",
+        f"{W}  â”‚  DAEMON minted the rate drops by 10%.   â”‚{R}",
+        f"{W}  â”‚  Then drops 10% every year until cap.   â”‚{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
-        f"{C}  ┌─ COMMANDS ──────────────────────────────┐{R}",
-        f"{g}  │  /daemon balance         — check wallet  │{R}",
-        f"{g}  │  /daemon send            — transfer       │{R}",
-        f"{g}  │  /daemon stats           — economy stats  │{R}",
-        f"{g}  │  /daemon info            — this guide     │{R}",
-        f"{g}  │  /arena rock/paper/scissors — commit      │{R}",
-        f"{g}  │  /arena gamefix          — restore board  │{R}",
-        f"{g}  │  /governance proposal    — submit vote    │{R}",
-        f"{g}  │  /governance vote        — cast a vote    │{R}",
-        f"{g}  │  /governance bid         — bid for slot   │{R}",
-        f"{C}  └────────────────────────────────────────┘{R}",
+        f"{C}  â”Œâ”€ COMMANDS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”{R}",
+        f"{g}  â”‚  /daemon balance         â€” check wallet  â”‚{R}",
+        f"{g}  â”‚  /daemon send            â€” transfer       â”‚{R}",
+        f"{g}  â”‚  /daemon stats           â€” economy stats  â”‚{R}",
+        f"{g}  â”‚  /daemon info            â€” this guide     â”‚{R}",
+        f"{g}  â”‚  /arena rock/paper/scissors â€” commit      â”‚{R}",
+        f"{g}  â”‚  /arena gamefix          â€” restore board  â”‚{R}",
+        f"{g}  â”‚  /governance proposal    â€” submit vote    â”‚{R}",
+        f"{g}  â”‚  /governance vote        â€” cast a vote    â”‚{R}",
+        f"{g}  â”‚  /governance bid         â€” bid for slot   â”‚{R}",
+        f"{C}  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜{R}",
         "",
         f"{D}  {ts_now()}{R}",
         "```",
@@ -4036,10 +4439,10 @@ async def daemon_info_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — ARENA CATEGORY
-# ─────────────────────────────────────────────────────────────────
-arena_group = app_commands.Group(name="arena", description="Daemon Arena — Rock Paper Scissors")
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” ARENA CATEGORY
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+arena_group = app_commands.Group(name="arena", description="Daemon Arena â€” Rock Paper Scissors")
 
 
 @arena_group.command(name="rock", description="Commit to Rock for the current arena")
@@ -4061,7 +4464,7 @@ async def scissors_cmd(interaction: discord.Interaction, amount: int):
 
 
 @arena_group.command(name="spread", description="Commit equally to Rock, Paper & Scissors in the current convergence")
-@app_commands.describe(amount="Total DAEMON to commit — must be divisible by 3")
+@app_commands.describe(amount="Total DAEMON to commit â€” must be divisible by 3")
 async def arena_spread_cmd(interaction: discord.Interaction, amount: int):
     await daemon_split_cmd(interaction, amount)
 
@@ -4071,7 +4474,7 @@ async def arena_spread_cmd(interaction: discord.Interaction, amount: int):
 async def arena_autospread_cmd(interaction: discord.Interaction, amount: int):
     if amount != 0 and get_autosplit_expiration() == 0:
         await interaction.response.send_message(
-            "❌ Arena autospread is currently disabled by admin.", ephemeral=True
+            "âŒ Arena autospread is currently disabled by admin.", ephemeral=True
         )
         return
     await daemon_dailysplit_cmd(interaction, amount)
@@ -4081,47 +4484,47 @@ async def arena_autospread_cmd(interaction: discord.Interaction, amount: int):
 @app_commands.describe(days="Number of days autospread may cover (0-14). Set to 0 to disable autospread for everyone.")
 async def arena_autospread_adjust_cmd(interaction: discord.Interaction, days: int):
     if interaction.user.id != GAMEFIX_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+        await interaction.response.send_message("âŒ Unauthorized.", ephemeral=True)
         return
     if days < 0 or days > 14:
-        await interaction.response.send_message("❌ Days must be between **0** and **14**.", ephemeral=True)
+        await interaction.response.send_message("âŒ Days must be between **0** and **14**.", ephemeral=True)
         return
     set_autosplit_expiration(days)
     msg = (
-        f"✅ Arena autospread maximum set to **{days}** day(s)."
+        f"âœ… Arena autospread maximum set to **{days}** day(s)."
         if days > 0 else
-        "✅ Arena autospread is now **disabled globally**. Existing autospreads will no longer execute."
+        "âœ… Arena autospread is now **disabled globally**. Existing autospreads will no longer execute."
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def _invest_slash(interaction: discord.Interaction, choice: str, amount: int):
     if amount < 1:
-        await interaction.response.send_message("❌ Minimum commit is **1** DAEMON.", ephemeral=True)
+        await interaction.response.send_message("âŒ Minimum commit is **1** DAEMON.", ephemeral=True)
         return
     arena = get_arena()
     if not arena["game_open"]:
-        await interaction.response.send_message("❌ No convergence is currently active.", ephemeral=True)
+        await interaction.response.send_message("âŒ No convergence is currently active.", ephemeral=True)
         return
     uid = interaction.user.id
     bal = get_balance(uid)
     if bal < amount:
         await interaction.response.send_message(
-            f"❌ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}", ephemeral=True)
+            f"âŒ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}", ephemeral=True)
         return
 
     add_balance(uid, -amount)
     add_investment(uid, choice, amount, arena["game_date"], arena["game_id"])
 
     D = "\u001b[0;90m"; G = "\u001b[1;32m"; W = "\u001b[0;37m"; Y = "\u001b[0;33m"; R = "\u001b[0m"
-    choice_emoji = {"rock": "🪨 ROCK", "paper": "📄 PAPER", "scissors": "✂️  SCISSORS"}
+    choice_emoji = {"rock": "ðŸª¨ ROCK", "paper": "ðŸ“„ PAPER", "scissors": "âœ‚ï¸  SCISSORS"}
     lines = [
         "```ansi",
         f"{G}  COMMIT CONFIRMED{R}",
-        f"{D}  Arena Date   ▸ {arena['game_date'][:10]}{R}",
-        f"{W}  Amount   ▸ {amount:,} DAEMON{R}",
-        f"{Y}  Pledged  ▸ {choice_emoji[choice]}{R}",
-        f"{W}  Bal      ▸ {get_balance(uid):,} DAEMON{R}",
+        f"{D}  Arena Date   â–¸ {arena['game_date'][:10]}{R}",
+        f"{W}  Amount   â–¸ {amount:,} DAEMON{R}",
+        f"{Y}  Pledged  â–¸ {choice_emoji[choice]}{R}",
+        f"{W}  Bal      â–¸ {get_balance(uid):,} DAEMON{R}",
         "```",
     ]
     await interaction.response.send_message(
@@ -4137,18 +4540,18 @@ async def _invest_slash(interaction: discord.Interaction, choice: str, amount: i
 @arena_group.command(name="gamefix", description="[RESTRICTED] Resend the active arena dashboard")
 async def daemon_gamefix_cmd(interaction: discord.Interaction):
     if interaction.user.id != GAMEFIX_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+        await interaction.response.send_message("âŒ Unauthorized.", ephemeral=True)
         return
 
     arena = get_arena()
     if not arena["game_open"]:
         await interaction.response.send_message(
-            "❌ No convergence is currently active. A new one will open shortly.", ephemeral=True)
+            "âŒ No convergence is currently active. A new one will open shortly.", ephemeral=True)
         return
 
     ch = bot.get_channel(ARENA_CHANNEL)
     if not ch:
-        await interaction.response.send_message("❌ Arena channel not found.", ephemeral=True)
+        await interaction.response.send_message("âŒ Arena channel not found.", ephemeral=True)
         return
 
     view   = ArenaView()
@@ -4156,7 +4559,7 @@ async def daemon_gamefix_cmd(interaction: discord.Interaction):
         arena["game_id"], arena["game_date"], arena["pot"],
         arena.get("next_end_ts", 0)
     )
-    header = f"```ansi\n\u001b[1;32m▶ DAEMON ARENA {format_arena_display_id(arena['game_date'])} (RESTORED)\u001b[0m\n```"
+    header = f"```ansi\n\u001b[1;32mâ–¶ DAEMON ARENA {format_arena_display_id(arena['game_date'])} (RESTORED)\u001b[0m\n```"
     msg    = await ch.send(content=header, embed=embed, view=view)
     set_arena(dashboard_msg=msg.id)
 
@@ -4164,8 +4567,8 @@ async def daemon_gamefix_cmd(interaction: discord.Interaction):
     lines = [
         "```ansi",
         f"{G}  ARENA BOARD RESTORED{R}",
-        f"{D}  Convergence  ▸ {format_arena_display_id(arena['game_date'])}{R}",
-        f"{D}  Date  ▸ {arena['game_date']}{R}",
+        f"{D}  Convergence  â–¸ {format_arena_display_id(arena['game_date'])}{R}",
+        f"{D}  Date  â–¸ {arena['game_date']}{R}",
         f"{D}  {ts_now()}{R}",
         "```",
     ]
@@ -4173,28 +4576,28 @@ async def daemon_gamefix_cmd(interaction: discord.Interaction):
         embed=discord.Embed(description="\n".join(lines), color=0x00FF41), ephemeral=True)
 
 
-# ─────────────────────────────────────────────────────────────────
-# SLASH COMMANDS — GOVERNANCE CATEGORY
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SLASH COMMANDS â€” GOVERNANCE CATEGORY
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 governance_group = app_commands.Group(name="governance", description="Daemon governance proposals and voting")
 
 
 @governance_group.command(name="proposal", description="Submit a governance proposal (7 days + random hours; 17-day cooldown)")
 @app_commands.describe(
-    percentage="% of circulating supply (YES weight) required to pass (1–100)",
+    percentage="% of circulating supply (YES weight) required to pass (1â€“100)",
     proposal_text="The proposal text (max 500 chars)"
 )
 async def proposal_cmd(interaction: discord.Interaction, percentage: int, proposal_text: str):
     if not (1 <= percentage <= 100):
-        await interaction.response.send_message("❌ Percentage must be 1–100.", ephemeral=True)
+        await interaction.response.send_message("âŒ Percentage must be 1â€“100.", ephemeral=True)
         return
     if len(proposal_text) > 500:
-        await interaction.response.send_message("❌ Max 500 characters.", ephemeral=True)
+        await interaction.response.send_message("âŒ Max 500 characters.", ephemeral=True)
         return
 
     pid, err = create_proposal(interaction.user.id, percentage, proposal_text)
     if err:
-        await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        await interaction.response.send_message(f"âŒ {err}", ephemeral=True)
         return
 
     prop = get_proposal(pid)
@@ -4211,7 +4614,7 @@ async def proposal_cmd(interaction: discord.Interaction, percentage: int, propos
 async def vote_cmd(interaction: discord.Interaction, proposal_id: int, vote: str):
     ok, msg = vote_proposal(proposal_id, interaction.user.id, vote)
     if not ok:
-        await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+        await interaction.response.send_message(f"âŒ {msg}", ephemeral=True)
         return
     prop = get_proposal(proposal_id)
     view = ProposalView(proposal_id)
@@ -4222,31 +4625,31 @@ async def vote_cmd(interaction: discord.Interaction, proposal_id: int, vote: str
 @app_commands.describe(amount="Amount of DAEMON to bid (must exceed current top bid)")
 async def proposal_bidding_cmd(interaction: discord.Interaction, amount: int):
     if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        await interaction.response.send_message("âŒ Amount must be positive.", ephemeral=True)
         return
 
     cycle = next_proposal_cycle()
     if not is_biddable_slot():
         await interaction.response.send_message(
-            f"❌ Slot #{cycle} is not biddable. The next biddable slot is #{cycle + (PROPOSAL_BID_EVERY - cycle % PROPOSAL_BID_EVERY)}.",
+            f"âŒ Slot #{cycle} is not biddable. The next biddable slot is #{cycle + (PROPOSAL_BID_EVERY - cycle % PROPOSAL_BID_EVERY)}.",
             ephemeral=True)
         return
 
     ok, msg = place_bid(interaction.user.id, amount)
     if not ok:
-        await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+        await interaction.response.send_message(f"âŒ {msg}", ephemeral=True)
         return
 
     G = "\u001b[1;32m"; Y = "\u001b[0;33m"; W = "\u001b[0;37m"; D = "\u001b[0;90m"; R = "\u001b[0m"
     lines = [
         "```ansi",
-        f"{G}╔══════════════════════════════════════════╗",
-        f"║       P R O P O S A L   B I D D I N G    ║",
-        f"╚══════════════════════════════════════════╝{R}",
+        f"{G}â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+        f"â•‘       P R O P O S A L   B I D D I N G    â•‘",
+        f"â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•{R}",
         "",
-        f"{Y}  Slot     ▸ #{cycle}{R}",
-        f"{G}  Your bid ▸ {amount:,} DAEMON{R}",
-        f"{W}  Balance  ▸ {get_balance(interaction.user.id):,} DAEMON{R}",
+        f"{Y}  Slot     â–¸ #{cycle}{R}",
+        f"{G}  Your bid â–¸ {amount:,} DAEMON{R}",
+        f"{W}  Balance  â–¸ {get_balance(interaction.user.id):,} DAEMON{R}",
         "",
         f"{D}  Highest bidder wins the right to post the{R}",
         f"{D}  next proposal, bypassing the 17-day cooldown.{R}",
@@ -4260,26 +4663,26 @@ async def proposal_bidding_cmd(interaction: discord.Interaction, amount: int):
 
 
 @daemon_group.command(name="split", description="Commit equally to Rock, Paper & Scissors in the current convergence")
-@app_commands.describe(amount="Total DAEMON to commit — must be divisible by 3")
+@app_commands.describe(amount="Total DAEMON to commit â€” must be divisible by 3")
 async def daemon_split_cmd(interaction: discord.Interaction, amount: int):
     if amount <= 0:
-        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        await interaction.response.send_message("âŒ Amount must be positive.", ephemeral=True)
         return
     if amount % 3 != 0:
-        await interaction.response.send_message(f"❌ Amount must be divisible by 3 (you entered **{amount:,}**).", ephemeral=True)
+        await interaction.response.send_message(f"âŒ Amount must be divisible by 3 (you entered **{amount:,}**).", ephemeral=True)
         return
     arena = get_arena()
     if not arena["game_open"]:
-        await interaction.response.send_message("❌ No convergence is currently active.", ephemeral=True)
+        await interaction.response.send_message("âŒ No convergence is currently active.", ephemeral=True)
         return
     uid = interaction.user.id
     bal = get_balance(uid)
     if bal < amount:
-        await interaction.response.send_message(f"❌ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}  (need {amount:,})", ephemeral=True)
+        await interaction.response.send_message(f"âŒ Insufficient balance: `{bal:,}` {DAEMON_EMOJI}  (need {amount:,})", ephemeral=True)
         return
     arena = get_arena()
     if not arena["game_open"]:
-        await interaction.response.send_message("❌ The convergence closed before your commit landed.", ephemeral=True)
+        await interaction.response.send_message("âŒ The convergence closed before your commit landed.", ephemeral=True)
         return
     share = amount // 3
     add_balance(uid, -amount)
@@ -4303,23 +4706,23 @@ async def daemon_split_cmd(interaction: discord.Interaction, amount: int):
 async def daemon_dailysplit_cmd(interaction: discord.Interaction, amount: int):
     uid = interaction.user.id
     if amount < 0:
-        await interaction.response.send_message("❌ Amount cannot be negative.", ephemeral=True)
+        await interaction.response.send_message("âŒ Amount cannot be negative.", ephemeral=True)
         return
     if amount == 0:
         expire_autosplit(uid)
-        await interaction.response.send_message("✅ Daily auto-split **disabled**. No further automatic commits will be made.", ephemeral=True)
+        await interaction.response.send_message("âœ… Daily auto-split **disabled**. No further automatic commits will be made.", ephemeral=True)
         return
     if amount % 3 != 0:
-        await interaction.response.send_message(f"❌ Amount must be divisible by 3 (you entered **{amount:,}**).", ephemeral=True)
+        await interaction.response.send_message(f"âŒ Amount must be divisible by 3 (you entered **{amount:,}**).", ephemeral=True)
         return
     bal = get_balance(uid)
     if bal < amount:
-        await interaction.response.send_message(f"❌ Insufficient balance for the first auto-split: `{bal:,}` {DAEMON_EMOJI}  (need {amount:,})", ephemeral=True)
+        await interaction.response.send_message(f"âŒ Insufficient balance for the first auto-split: `{bal:,}` {DAEMON_EMOJI}  (need {amount:,})", ephemeral=True)
         return
     expiry = get_autosplit_expiration()
     if expiry <= 0:
         await interaction.response.send_message(
-            "❌ Auto-spread is currently disabled by admin.", ephemeral=True
+            "âŒ Auto-spread is currently disabled by admin.", ephemeral=True
         )
         return
     arena = get_arena()
@@ -4337,14 +4740,14 @@ async def daemon_market_cmd(interaction: discord.Interaction):
     def fmt_row(price, amt, cum, prefix):
         return f"{prefix} {price:>{PW},.4f}   {str(int(amt)):>{AW}}   {str(int(cum)):>{CW}}"
 
-    header = f"  {'PRICE (🐉)':>{PW}}   {'AMOUNT':>{AW}}   {'CUMUL':>{CW}}"
-    divider = "  " + "─" * (BAR_W - 2)
+    header = f"  {'PRICE (ðŸ‰)':>{PW}}   {'AMOUNT':>{AW}}   {'CUMUL':>{CW}}"
+    divider = "  " + "â”€" * (BAR_W - 2)
     lines = []
     if asks:
         for lvl in reversed(asks):
             lines.append(fmt_row(lvl["price"], lvl["amount"], lvl["cumulative"], "-"))
     else:
-        lines.append(f"-  {'— no sell orders —':^{BAR_W - 4}}")
+        lines.append(f"-  {'â€” no sell orders â€”':^{BAR_W - 4}}")
     if asks and bids:
         sp = asks[0]["price"] - bids[0]["price"]
         sp_pct = (sp / asks[0]["price"]) * 100 if asks[0]["price"] else 0
@@ -4356,24 +4759,38 @@ async def daemon_market_cmd(interaction: discord.Interaction):
         for lvl in bids:
             lines.append(fmt_row(lvl["price"], lvl["amount"], lvl["cumulative"], "+"))
     else:
-        lines.append(f"+  {'— no buy orders —':^{BAR_W - 4}}")
+        lines.append(f"+  {'â€” no buy orders â€”':^{BAR_W - 4}}")
     book_block = f"```diff\n{header}\n{divider}\n" + "\n".join(lines) + f"\n{divider}\n```"
-    embed = discord.Embed(title="📊  Daemon Order Book", description=book_block, color=0x1E90FF)
-    embed.set_footer(text="Red = asks (sell)  ·  Green = bids (buy)  ·  /daemon sell | /daemon buy  ·  prices in 🐉")
+    embed = discord.Embed(title="ðŸ“Š  Daemon Order Book", description=book_block, color=0x1E90FF)
+    embed.set_footer(text="Red = asks (sell)  Â·  Green = bids (buy)  Â·  /daemon sell | /daemon buy  Â·  prices in ðŸ‰")
     await interaction.followup.send(embed=embed)
 
 
 @daemon_group.command(name="sell", description="List Daemon for sale at a set price")
-@app_commands.describe(amount="Amount of DAEMON to list", price_per="Price per DAEMON in 🐉")
-async def daemon_sell_cmd(interaction: discord.Interaction, amount: int, price_per: float):
+@app_commands.describe(amount="Amount of DAEMON to list, or `all`", price_per="Price per DAEMON in ðŸ‰")
+async def daemon_sell_cmd(interaction: discord.Interaction, amount: str, price_per: float):
     await interaction.response.defer(ephemeral=True)
-    if amount <= 0 or price_per <= 0:
+    if price_per <= 0:
         await interaction.followup.send(embed=err_embed("Amount and price must be positive."), ephemeral=True)
         return
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Link your Minecraft account first with `/economy link`."), ephemeral=True)
+    mc_uuid = dragon_account_uuid(interaction.user.id)
+    amount_raw = amount
+    bal = get_balance(interaction.user.id)
+    amount_value = bal if amount_raw.strip().lower() == "all" else parse_whole_amount(amount_raw)
+    if amount_value is None or amount_value <= 0:
+        await interaction.followup.send(embed=err_embed("Amount must be a positive whole number or `all`."), ephemeral=True)
         return
+    if bal < amount_value:
+        await interaction.followup.send(embed=err_embed(f"Insufficient DAEMON balance: {bal:,}."), ephemeral=True)
+        return
+    confirmed = await confirm_daemon_spend_for_interaction(
+        interaction,
+        amount_value,
+        "placing a DAEMON sell order",
+    )
+    if not confirmed:
+        return
+    amount = amount_value
 
     async with _daemon_market_lock:
         bal = get_balance(interaction.user.id)
@@ -4394,7 +4811,7 @@ async def daemon_sell_cmd(interaction: discord.Interaction, amount: int, price_p
             return
 
     msg = (
-        f"Sell order placed! **{amount:,}** DAEMON @ **🐉 {price_per:.4f}** each.\n"
+        f"Sell order placed! **{amount:,}** DAEMON @ **ðŸ‰ {price_per:.4f}** each.\n"
         f"Order ID: **#{order_id}**"
     )
     if trades:
@@ -4402,12 +4819,12 @@ async def daemon_sell_cmd(interaction: discord.Interaction, amount: int, price_p
         if own_fills:
             sold = sum(t["amount"] for t in own_fills)
             value = sum(t["value"] for t in own_fills)
-            msg += f"\nFilled immediately: **{sold:,}** DAEMON for **🐉 {value:,.4f}**."
+            msg += f"\nFilled immediately: **{sold:,}** DAEMON for **ðŸ‰ {value:,.4f}**."
     await interaction.followup.send(embed=ok_embed(msg), ephemeral=True)
     await log_transaction(
         interaction.guild,
-        "📋 DAEMON Sell Order Placed",
-        f"<@{interaction.user.id}> listed **{amount:,} DAEMON** @ **🐉 {price_per:.8f}** each · Order **#{order_id}**",
+        "ðŸ“‹ DAEMON Sell Order Placed",
+        f"<@{interaction.user.id}> listed **{amount:,} DAEMON** @ **ðŸ‰ {price_per:.8f}** each Â· Order **#{order_id}**",
         color=BLUE,
     )
     await log_daemon_trades(interaction.guild, trades)
@@ -4415,17 +4832,25 @@ async def daemon_sell_cmd(interaction: discord.Interaction, amount: int, price_p
 
 
 @daemon_group.command(name="buy", description="Place a limit buy order for Daemon")
-@app_commands.describe(amount="Amount of DAEMON to buy", price_per="Max price per DAEMON in 🐉 you'll pay")
-async def daemon_buy_cmd(interaction: discord.Interaction, amount: int, price_per: float):
+@app_commands.describe(amount="Amount of DAEMON to buy, or `all`", price_per="Max price per DAEMON in ðŸ‰ you'll pay")
+async def daemon_buy_cmd(interaction: discord.Interaction, amount: str, price_per: float):
     await interaction.response.defer(ephemeral=True)
-    if amount <= 0 or price_per <= 0:
+    if price_per <= 0:
         await interaction.followup.send(embed=err_embed("Amount and price must be positive."), ephemeral=True)
         return
-    mc_uuid = await get_mc_uuid(str(interaction.user.id))
-    if not mc_uuid:
-        await interaction.followup.send(embed=err_embed("Link your Minecraft account first with `/economy link`."), ephemeral=True)
-        return
+    mc_uuid = dragon_account_uuid(interaction.user.id)
 
+    dragon_balance = await fetch_dragon_balance(interaction.user.id)
+    if dragon_balance is None:
+        await interaction.followup.send(embed=err_embed("Error fetching Dragon balance."), ephemeral=True)
+        return
+    vault_dragons = float(dragon_balance.get("mdragons", 0) or 0)
+    amount_raw = amount
+    amount_value = math.floor(vault_dragons / float(price_per)) if amount_raw.strip().lower() == "all" else parse_whole_amount(amount_raw)
+    if amount_value is None or amount_value <= 0:
+        await interaction.followup.send(embed=err_embed("Amount must be a positive whole number or `all`."), ephemeral=True)
+        return
+    amount = amount_value
     reserve = amount * float(price_per)
     try:
         vault_dragons = await get_vault_dragons(mc_uuid)
@@ -4433,7 +4858,15 @@ async def daemon_buy_cmd(interaction: discord.Interaction, amount: int, price_pe
         await interaction.followup.send(embed=err_embed(str(e)), ephemeral=True)
         return
     if vault_dragons < reserve:
-        await interaction.followup.send(embed=err_embed(f"Insufficient 🐉 in vault: have {vault_dragons:,.4f}, need {reserve:,.4f}."), ephemeral=True)
+        await interaction.followup.send(embed=err_embed(f"Insufficient ðŸ‰ in vault: have {vault_dragons:,.4f}, need {reserve:,.4f}."), ephemeral=True)
+        return
+
+    confirmed = await confirm_daemon_spend_for_interaction(
+        interaction,
+        amount,
+        "placing a DAEMON buy order",
+    )
+    if not confirmed:
         return
 
     async with _daemon_market_lock:
@@ -4456,7 +4889,7 @@ async def daemon_buy_cmd(interaction: discord.Interaction, amount: int, price_pe
             return
 
     msg = (
-        f"Buy order placed! Up to **{amount:,}** DAEMON @ **🐉 {price_per:.4f}** each.\n"
+        f"Buy order placed! Up to **{amount:,}** DAEMON @ **ðŸ‰ {price_per:.4f}** each.\n"
         f"Order ID: **#{order_id}**"
     )
     if trades:
@@ -4464,12 +4897,12 @@ async def daemon_buy_cmd(interaction: discord.Interaction, amount: int, price_pe
         if own_fills:
             bought = sum(t["amount"] for t in own_fills)
             value = sum(t["value"] for t in own_fills)
-            msg += f"\nFilled immediately: **{bought:,}** DAEMON for **🐉 {value:,.4f}**."
+            msg += f"\nFilled immediately: **{bought:,}** DAEMON for **ðŸ‰ {value:,.4f}**."
     await interaction.followup.send(embed=ok_embed(msg), ephemeral=True)
     await log_transaction(
         interaction.guild,
-        "📋 DAEMON Buy Order Placed",
-        f"<@{interaction.user.id}> bid for **{amount:,} DAEMON** @ up to **🐉 {price_per:.8f}** each · Order **#{order_id}**",
+        "ðŸ“‹ DAEMON Buy Order Placed",
+        f"<@{interaction.user.id}> bid for **{amount:,} DAEMON** @ up to **ðŸ‰ {price_per:.8f}** each Â· Order **#{order_id}**",
         color=BLUE,
     )
     await log_daemon_trades(interaction.guild, trades)
@@ -4481,13 +4914,13 @@ async def daemon_orders_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     orders = get_user_daemon_orders(interaction.user.id)
     if not orders:
-        await interaction.followup.send(embed=discord.Embed(description="📭  You have no open Daemon orders.", color=0x1E90FF), ephemeral=True)
+        await interaction.followup.send(embed=discord.Embed(description="ðŸ“­  You have no open Daemon orders.", color=0x1E90FF), ephemeral=True)
         return
     lines = []
     for o in orders:
-        side_icon = "📤" if o["side"] == "sell" else "📥"
-        lines.append(f"{side_icon} **#{o['id']}** {o['side'].upper()} {int(o['remaining']):,}/{int(o['amount']):,} DAEMON @ 🐉 {float(o['price_per']):.4f}")
-    embed = discord.Embed(title="📋  Your Daemon Orders", description="\n".join(lines), color=0x1E90FF)
+        side_icon = "ðŸ“¤" if o["side"] == "sell" else "ðŸ“¥"
+        lines.append(f"{side_icon} **#{o['id']}** {o['side'].upper()} {int(o['remaining']):,}/{int(o['amount']):,} DAEMON @ ðŸ‰ {float(o['price_per']):.4f}")
+    embed = discord.Embed(title="ðŸ“‹  Your Daemon Orders", description="\n".join(lines), color=0x1E90FF)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -4519,7 +4952,7 @@ async def daemon_cancel_order_cmd(interaction: discord.Interaction, order_id: in
     await interaction.followup.send(embed=ok_embed(f"Order **#{order_id}** cancelled."), ephemeral=True)
     await log_transaction(
         interaction.guild,
-        "📋 DAEMON Order Cancelled",
+        "ðŸ“‹ DAEMON Order Cancelled",
         f"<@{interaction.user.id}> cancelled **{side.upper()}** order **#{order_id}** with **{remaining:,} DAEMON** remaining.",
         color=0xFF6F00,
     )
@@ -4529,11 +4962,11 @@ async def daemon_cancel_order_cmd(interaction: discord.Interaction, order_id: in
 @arena_group.command(name="cancel", description="[RESTRICTED] Void the current convergence and refund all commits")
 async def arena_cancel_cmd(interaction: discord.Interaction):
     if interaction.user.id != GAMEFIX_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+        await interaction.response.send_message("âŒ Unauthorized.", ephemeral=True)
         return
     arena = get_arena()
     if not arena["game_open"]:
-        await interaction.response.send_message("❌ No convergence is currently active.", ephemeral=True)
+        await interaction.response.send_message("âŒ No convergence is currently active.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     gid = arena["game_id"]
@@ -4548,31 +4981,31 @@ async def arena_cancel_cmd(interaction: discord.Interaction):
 @arena_group.command(name="forcestart", description="[RESTRICTED] Immediately open a new convergence")
 async def arena_forcestart_cmd(interaction: discord.Interaction):
     if interaction.user.id != GAMEFIX_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+        await interaction.response.send_message("âŒ Unauthorized.", ephemeral=True)
         return
     arena = get_arena()
     if arena["game_open"]:
-        await interaction.response.send_message("❌ A convergence is already active.", ephemeral=True)
+        await interaction.response.send_message("âŒ A convergence is already active.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     await _boot_open_arena()
     await interaction.followup.send(embed=ok_embed("New convergence opened."), ephemeral=True)
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ADMIN PREFIX COMMANDS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @daemon_group.command(name="dailysplitexpiration", description="[ADMIN] Set how many games a daily split lasts before expiring")
 @app_commands.describe(games="Number of games until expiration (0 = never expires)")
 async def daemon_dailysplit_expiration_cmd(interaction: discord.Interaction, games: int):
     if interaction.user.id != GAMEFIX_USER_ID:
-        await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+        await interaction.response.send_message("âŒ Unauthorized.", ephemeral=True)
         return
     if games < 0:
-        await interaction.response.send_message("❌ Must be 0 or greater (0 = never expires).", ephemeral=True)
+        await interaction.response.send_message("âŒ Must be 0 or greater (0 = never expires).", ephemeral=True)
         return
     set_autosplit_expiration(games)
-    msg = (f"✅ Daily split expiration set to **{games}** game(s)." if games > 0 else "✅ Daily split expiration **disabled** — splits will run indefinitely.")
+    msg = (f"âœ… Daily split expiration set to **{games}** game(s)." if games > 0 else "âœ… Daily split expiration **disabled** â€” splits will run indefinitely.")
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -4587,13 +5020,13 @@ async def supply_check(ctx: commands.Context):
     lines = [
         "```ansi",
         f"{RR}  ADMIN SUPPLY REPORT{R}",
-        f"{W}  Minted      ▸ {em['cumulative_minted']:,} / {MAX_SUPPLY:,}{R}",
-        f"{W}  Daily       ▸ {em['current_daily']:,}{R}",
-        f"{W}  Red. Year   ▸ {em['reduction_year']}{R}",
-        f"{W}  Cycle Start ▸ <t:{int(em['cycle_start_ts'])}:f>{R}",
-        f"{W}  Holders     ▸ {holders}{R}",
-        f"{W}  Convergence  ▸ {format_arena_display_id(arena['game_date'])}  Open={bool(arena['game_open'])}{R}",
-        f"{W}  Next Consensus  ▸ <t:{int(end_ts)}:f>{R}",
+        f"{W}  Minted      â–¸ {em['cumulative_minted']:,} / {MAX_SUPPLY:,}{R}",
+        f"{W}  Daily       â–¸ {em['current_daily']:,}{R}",
+        f"{W}  Red. Year   â–¸ {em['reduction_year']}{R}",
+        f"{W}  Cycle Start â–¸ <t:{int(em['cycle_start_ts'])}:f>{R}",
+        f"{W}  Holders     â–¸ {holders}{R}",
+        f"{W}  Convergence  â–¸ {format_arena_display_id(arena['game_date'])}  Open={bool(arena['game_open'])}{R}",
+        f"{W}  Next Consensus  â–¸ <t:{int(end_ts)}:f>{R}",
         f"{D}  {ts_now()}{R}",
         "```",
     ]
@@ -4601,9 +5034,9 @@ async def supply_check(ctx: commands.Context):
 
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # TOP-LEVEL QUICK ARENA COMMANDS
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @bot.tree.command(name="rock", description="Commit to Rock for the current arena")
 @app_commands.describe(amount="Amount to commit (min 1)")
 async def quick_rock_cmd(interaction: discord.Interaction, amount: int):
@@ -4622,9 +5055,9 @@ async def quick_scissors_cmd(interaction: discord.Interaction, amount: int):
     await _invest_slash(interaction, "scissors", amount)
 
 
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # REGISTER COMMAND GROUPS & RUN
-# ─────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 bot.tree.add_command(economy)
 bot.tree.add_command(market_group)
 bot.tree.add_command(lists_group)
@@ -4637,6 +5070,4 @@ if __name__ == "__main__":
     token = TOKEN
     if not token:
         raise RuntimeError("DISCORD_TOKEN is not set")
-    if not API_KEY:
-        raise RuntimeError("API_KEY is not set")
     bot.run(token)

@@ -15,6 +15,9 @@ import secrets
 app = FastAPI()
 DB_PATH = os.environ.get("DB_PATH", "/app/data/mdragons.db")
 API_KEY = os.environ.get("API_KEY", "").strip()
+if not API_KEY:
+    raise RuntimeError("API_KEY must be set before starting the FastAPI backend. Refusing to run an unauthenticated API.")
+API_KEY_HEADER = "X-API-Key"
 PUBLIC_API_PATHS = {"/api/health"}
 GERMAN_TZ = ZoneInfo("Europe/Berlin")
 logger = logging.getLogger("mdragons.app")
@@ -22,6 +25,7 @@ logger = logging.getLogger("mdragons.app")
 # ─── System accounts for special mechanics ───────────────────────────────────
 SYSTEM_MM_UUID = "SYSTEM_MANSA_MUSA"
 SYSTEM_NO_UUID = "SYSTEM_NETHERITE_OVERLORD"
+DRAGON_ACCOUNT_PREFIX = "DISCORD_"
 
 # Price curve factors
 MM_FLOOR_FACTOR = 0.55
@@ -317,24 +321,21 @@ def init_db():
     if "logged" not in bounty_cols:
         c.execute("ALTER TABLE bounty_events ADD COLUMN logged INTEGER NOT NULL DEFAULT 0")
 
+    migrate_discord_dragon_balances(c)
+
     conn.commit()
     conn.close()
 
 
 @app.on_event("startup")
 async def startup():
-    if not API_KEY:
-        raise RuntimeError("API_KEY is not set; refusing to start with unprotected /api endpoints")
     init_db()
 
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    path = request.url.path
-    if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
-        supplied_key = request.headers.get("X-API-Key", "")
-        if not API_KEY:
-            return JSONResponse(status_code=503, content={"detail": "API key is not configured"})
+    if request.url.path.startswith("/api/") and request.url.path not in PUBLIC_API_PATHS:
+        supplied_key = request.headers.get(API_KEY_HEADER, "")
         if not secrets.compare_digest(supplied_key, API_KEY):
             return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
     return await call_next(request)
@@ -403,6 +404,178 @@ def item_col(item_key: str) -> str:
     if item_key == "DAEMON":
         return "mdragons"
     raise ValueError(f"Unknown legacy item: {item_key}")
+
+
+def dragon_account_uuid(discord_id: str) -> str:
+    return f"{DRAGON_ACCOUNT_PREFIX}{str(discord_id).strip()}"
+
+
+def discord_id_from_dragon_account(mc_uuid: str) -> Optional[str]:
+    if not str(mc_uuid).startswith(DRAGON_ACCOUNT_PREFIX):
+        return None
+    discord_id = str(mc_uuid)[len(DRAGON_ACCOUNT_PREFIX):]
+    return discord_id if discord_id.isdigit() else None
+
+
+def dragon_account_for_uuid(c, mc_uuid: str) -> str:
+    mc_uuid = str(mc_uuid)
+    if mc_uuid.startswith("SYSTEM_") or mc_uuid.startswith(DRAGON_ACCOUNT_PREFIX):
+        return mc_uuid
+    c.execute("SELECT discord_id FROM linked_accounts WHERE mc_uuid=?", (mc_uuid,))
+    row = c.fetchone()
+    return dragon_account_uuid(row[0]) if row else mc_uuid
+
+
+def ensure_balance_row(c, mc_uuid: str):
+    c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (str(mc_uuid),))
+
+
+def migrate_discord_dragon_balance(c, mc_uuid: str, discord_id: str):
+    mc_uuid = str(mc_uuid)
+    if mc_uuid.startswith("SYSTEM_") or mc_uuid.startswith(DRAGON_ACCOUNT_PREFIX):
+        return
+    account_uuid = dragon_account_uuid(discord_id)
+    c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (mc_uuid,))
+    row = c.fetchone()
+    amount = float(row[0]) if row and row[0] else 0.0
+    if amount <= 0:
+        ensure_balance_row(c, account_uuid)
+        return
+    ensure_balance_row(c, account_uuid)
+    c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (amount, account_uuid))
+    c.execute("UPDATE balances SET mdragons=0 WHERE mc_uuid=?", (mc_uuid,))
+
+
+def migrate_discord_dragon_balances(c):
+    c.execute("SELECT mc_uuid, discord_id FROM linked_accounts")
+    rows = c.fetchall()
+    for mc_uuid, discord_id in rows:
+        migrate_discord_dragon_balance(c, mc_uuid, discord_id)
+        migrate_discord_item_balances(c, mc_uuid, discord_id)
+        c.execute(
+            "UPDATE orders SET mc_uuid=? WHERE mc_uuid=? AND (is_system IS NULL OR is_system=0)",
+            (dragon_account_uuid(discord_id), mc_uuid),
+        )
+
+
+def get_mdragon_balance(c, owner_uuid: str) -> float:
+    account_uuid = dragon_account_for_uuid(c, owner_uuid)
+    c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (account_uuid,))
+    row = c.fetchone()
+    return float(row[0]) if row and row[0] else 0.0
+
+
+def credit_mdragons(c, owner_uuid: str, amount: float) -> str:
+    account_uuid = dragon_account_for_uuid(c, owner_uuid)
+    ensure_balance_row(c, account_uuid)
+    c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (amount, account_uuid))
+    return account_uuid
+
+
+def debit_mdragons(c, owner_uuid: str, amount: float) -> bool:
+    account_uuid = dragon_account_for_uuid(c, owner_uuid)
+    ensure_balance_row(c, account_uuid)
+    c.execute(
+        "UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=? AND mdragons>=?",
+        (amount, account_uuid, amount),
+    )
+    return c.rowcount == 1
+
+
+def dragon_order_owner_keys(c, owner_uuid: str) -> list[str]:
+    owner_uuid = str(owner_uuid)
+    account_uuid = dragon_account_for_uuid(c, owner_uuid)
+    keys = [account_uuid]
+    discord_id = discord_id_from_dragon_account(account_uuid)
+    if discord_id:
+        c.execute("SELECT mc_uuid FROM linked_accounts WHERE discord_id=?", (discord_id,))
+        keys.extend(row[0] for row in c.fetchall())
+    if owner_uuid not in keys:
+        keys.append(owner_uuid)
+    return list(dict.fromkeys(keys))
+
+
+def linked_mc_for_dragon_account(c, account_uuid: str) -> Optional[str]:
+    discord_id = discord_id_from_dragon_account(account_uuid)
+    if not discord_id:
+        return None
+    c.execute("SELECT mc_uuid FROM linked_accounts WHERE discord_id=?", (discord_id,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+def order_owner_uuid(c, owner_uuid: str) -> str:
+    owner_uuid = str(owner_uuid)
+    if owner_uuid.startswith("SYSTEM_") or owner_uuid.startswith(DRAGON_ACCOUNT_PREFIX):
+        return owner_uuid
+    return dragon_account_for_uuid(c, owner_uuid)
+
+
+def order_owner_keys(c, owner_uuid: str) -> list[str]:
+    owner_uuid = str(owner_uuid)
+    keys = [order_owner_uuid(c, owner_uuid)]
+    if owner_uuid.startswith(DRAGON_ACCOUNT_PREFIX):
+        linked_mc = linked_mc_for_dragon_account(c, owner_uuid)
+        if linked_mc:
+            keys.append(linked_mc)
+    elif not owner_uuid.startswith("SYSTEM_"):
+        account_uuid = dragon_account_for_uuid(c, owner_uuid)
+        if account_uuid != owner_uuid:
+            keys.append(owner_uuid)
+    return list(dict.fromkeys(keys))
+
+
+def item_account_for_order_owner(c, owner_uuid: str) -> str:
+    owner_uuid = str(owner_uuid)
+    if owner_uuid.startswith(DRAGON_ACCOUNT_PREFIX):
+        linked_mc = linked_mc_for_dragon_account(c, owner_uuid)
+        if linked_mc:
+            return linked_mc
+    return owner_uuid
+
+
+def migrate_discord_item_balances(c, mc_uuid: str, discord_id: str):
+    account_uuid = dragon_account_uuid(discord_id)
+    if account_uuid == mc_uuid:
+        return
+
+    ensure_balance_row(c, mc_uuid)
+    c.execute("SELECT netherite, diamond FROM balances WHERE mc_uuid=?", (account_uuid,))
+    legacy = c.fetchone()
+    if legacy:
+        netherite, diamond = legacy
+        if netherite:
+            c.execute("UPDATE balances SET netherite=netherite+? WHERE mc_uuid=?", (netherite, mc_uuid))
+            c.execute("UPDATE balances SET netherite=0 WHERE mc_uuid=?", (account_uuid,))
+        if diamond:
+            c.execute("UPDATE balances SET diamond=diamond+? WHERE mc_uuid=?", (diamond, mc_uuid))
+            c.execute("UPDATE balances SET diamond=0 WHERE mc_uuid=?", (account_uuid,))
+
+    c.execute("SELECT commodity, amount FROM commodity_balances WHERE mc_uuid=?", (account_uuid,))
+    rows = c.fetchall()
+    for commodity, amount in rows:
+        c.execute(
+            """INSERT INTO commodity_balances (mc_uuid, commodity, amount)
+               VALUES (?, ?, ?)
+               ON CONFLICT(mc_uuid, commodity)
+               DO UPDATE SET amount = amount + excluded.amount""",
+            (mc_uuid, commodity, amount),
+        )
+    if rows:
+        c.execute("DELETE FROM commodity_balances WHERE mc_uuid=?", (account_uuid,))
+
+
+def locked_mdragons_for_account(c, owner_uuid: str) -> float:
+    owner_keys = dragon_order_owner_keys(c, owner_uuid)
+    placeholders = ",".join("?" for _ in owner_keys)
+    c.execute(
+        f"""SELECT COALESCE(SUM(remaining * price_per), 0) FROM orders
+            WHERE mc_uuid IN ({placeholders}) AND side='buy' AND remaining>0
+            AND (is_system IS NULL OR is_system=0)""",
+        owner_keys,
+    )
+    row = c.fetchone()
+    return float(row[0]) if row and row[0] else 0.0
 
 
 def compute_reference_price(c, item_key: str) -> float:
@@ -538,9 +711,12 @@ def place_system_order(c, system_uuid: str, item_key: str, side: str, price_per:
 
 
 def _credit_item(c, mc_uuid: str, item_key: str, amount: float):
+    if item_key == "DAEMON":
+        credit_mdragons(c, mc_uuid, amount)
+        return
     if is_legacy_item(item_key):
         col = item_col(item_key)
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (mc_uuid,))
+        ensure_balance_row(c, mc_uuid)
         c.execute(f"UPDATE balances SET {col}={col}+? WHERE mc_uuid=?", (amount, mc_uuid))
     else:
         c.execute(
@@ -553,9 +729,11 @@ def _credit_item(c, mc_uuid: str, item_key: str, amount: float):
 
 
 def _debit_item(c, mc_uuid: str, item_key: str, amount: float) -> bool:
+    if item_key == "DAEMON":
+        return debit_mdragons(c, mc_uuid, amount)
     if is_legacy_item(item_key):
         col = item_col(item_key)
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (mc_uuid,))
+        ensure_balance_row(c, mc_uuid)
         c.execute(f"SELECT {col} FROM balances WHERE mc_uuid=?", (mc_uuid,))
         row = c.fetchone()
         current = row[0] if row else 0
@@ -582,9 +760,11 @@ def _debit_item(c, mc_uuid: str, item_key: str, amount: float) -> bool:
 
 
 def _get_item_balance(c, mc_uuid: str, item_key: str) -> float:
+    if item_key == "DAEMON":
+        return get_mdragon_balance(c, mc_uuid)
     if is_legacy_item(item_key):
         col = item_col(item_key)
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (mc_uuid,))
+        ensure_balance_row(c, mc_uuid)
         c.execute(f"SELECT {col} FROM balances WHERE mc_uuid=?", (mc_uuid,))
         row = c.fetchone()
         return row[0] if row else 0.0
@@ -661,15 +841,13 @@ def match_orders(c, item: str):
         is_sys_buyer = str(buyer_uuid).startswith("SYSTEM_")
 
         if not is_sys_seller:
-            c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (seller_uuid,))
-            c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (cost, seller_uuid))
+            credit_mdragons(c, seller_uuid, cost)
 
         if not is_sys_buyer:
-            _credit_item(c, buyer_uuid, item, fill_amount)
+            _credit_item(c, item_account_for_order_owner(c, buyer_uuid), item, fill_amount)
             if trade_price < bid_price:
                 excess = (bid_price - trade_price) * fill_amount
-                c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (buyer_uuid,))
-                c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (excess, buyer_uuid))
+                credit_mdragons(c, buyer_uuid, excess)
 
         c.execute(
             """INSERT INTO trade_log (item, buyer_uuid, seller_uuid, amount, price_per, value)
@@ -933,7 +1111,8 @@ async def deposit(data: DepositWithdraw):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.uuid,))
+    if item_key != "DAEMON":
+        ensure_balance_row(c, data.uuid)
     _credit_item(c, data.uuid, item_key, data.amount)
     conn.commit()
     conn.close()
@@ -981,9 +1160,23 @@ async def verify_link(data: VerifyLink):
         conn.close()
         raise HTTPException(400, "Invalid or expired code")
     mc_uuid = row[0]
+    c.execute("SELECT mc_uuid FROM linked_accounts WHERE discord_id=?", (data.discord_id,))
+    old_link = c.fetchone()
+    if old_link:
+        migrate_discord_dragon_balance(c, old_link[0], data.discord_id)
+    c.execute("SELECT discord_id FROM linked_accounts WHERE mc_uuid=?", (mc_uuid,))
+    old_discord = c.fetchone()
+    if old_discord and old_discord[0] != data.discord_id:
+        migrate_discord_dragon_balance(c, mc_uuid, old_discord[0])
     c.execute("INSERT OR REPLACE INTO linked_accounts (mc_uuid, discord_id) VALUES (?,?)",
               (mc_uuid, data.discord_id))
-    c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (mc_uuid,))
+    ensure_balance_row(c, mc_uuid)
+    migrate_discord_dragon_balance(c, mc_uuid, data.discord_id)
+    migrate_discord_item_balances(c, mc_uuid, data.discord_id)
+    c.execute(
+        "UPDATE orders SET mc_uuid=? WHERE mc_uuid=? AND (is_system IS NULL OR is_system=0)",
+        (dragon_account_uuid(data.discord_id), mc_uuid),
+    )
     c.execute("DELETE FROM pending_links WHERE code=?", (data.code,))
     conn.commit()
     conn.close()
@@ -994,28 +1187,11 @@ async def verify_link(data: VerifyLink):
 async def get_balance_endpoint(mc_uuid: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT netherite, diamond, mdragons FROM balances WHERE mc_uuid=?", (mc_uuid,))
+    c.execute("SELECT netherite, diamond FROM balances WHERE mc_uuid=?", (mc_uuid,))
     row = c.fetchone()
-    if not row:
-        conn.close()
-        return {
-            "netherite": 0,
-            "diamond": 0,
-            "mdragons": 0.0,
-            "mdragons_locked": 0.0,
-            "mdragons_total": 0.0,
-        }
-
-    netherite, diamond, mdragons = row
-
-    c.execute(
-        """SELECT COALESCE(SUM(remaining * price_per), 0) FROM orders
-           WHERE mc_uuid=? AND side='buy' AND remaining>0
-           AND (is_system IS NULL OR is_system=0)""",
-        (mc_uuid,),
-    )
-    locked_row = c.fetchone()
-    mdragons_locked = locked_row[0] if locked_row else 0.0
+    netherite, diamond = row if row else (0, 0)
+    mdragons = get_mdragon_balance(c, mc_uuid)
+    mdragons_locked = locked_mdragons_for_account(c, mc_uuid)
     conn.close()
 
     return {
@@ -1039,8 +1215,8 @@ async def adjust_balance(data: AdjustBalance):
         c = conn.cursor()
         old_balance = _get_item_balance(c, data.mc_uuid, item_key)
         if data.delta >= 0:
-            if is_legacy_item(item_key):
-                c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
+            if is_legacy_item(item_key) and item_key != "DAEMON":
+                ensure_balance_row(c, data.mc_uuid)
             _credit_item(c, data.mc_uuid, item_key, data.delta)
         else:
             if not _debit_item(c, data.mc_uuid, item_key, -data.delta):
@@ -1075,19 +1251,15 @@ async def give_dragons(data: GiveTransfer):
     try:
         begin_immediate(conn)
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.sender_uuid,))
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.recipient_uuid,))
-        c.execute(
-            "UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=? AND mdragons>=?",
-            (data.amount, data.sender_uuid, data.amount),
-        )
-        if c.rowcount != 1:
+        sender_account = dragon_account_for_uuid(c, data.sender_uuid)
+        recipient_account = dragon_account_for_uuid(c, data.recipient_uuid)
+        if sender_account == recipient_account:
+            raise HTTPException(400, "Cannot give to yourself")
+        if not debit_mdragons(c, data.sender_uuid, data.amount):
             raise HTTPException(400, "Insufficient dragons")
-        c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (data.amount, data.recipient_uuid))
-        c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (data.sender_uuid,))
-        sender_balance = c.fetchone()[0]
-        c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (data.recipient_uuid,))
-        recipient_balance = c.fetchone()[0]
+        credit_mdragons(c, data.recipient_uuid, data.amount)
+        sender_balance = get_mdragon_balance(c, data.sender_uuid)
+        recipient_balance = get_mdragon_balance(c, data.recipient_uuid)
         conn.commit()
         return {
             "status": "sent",
@@ -1123,20 +1295,15 @@ async def claim_login_reward(data: LoginRewardClaim):
         )
         duplicate = c.rowcount == 0
         if not duplicate:
-            c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-            c.execute(
-                "UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?",
-                (WEEKLY_LOGIN_REWARD, data.mc_uuid),
-            )
-        c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (data.mc_uuid,))
-        row = c.fetchone()
+            credit_mdragons(c, data.mc_uuid, WEEKLY_LOGIN_REWARD)
+        balance = get_mdragon_balance(c, data.mc_uuid)
         conn.commit()
         return {
             "status": "claimed",
             "duplicate": duplicate,
             "amount": 0 if duplicate else WEEKLY_LOGIN_REWARD,
             "configured_amount": WEEKLY_LOGIN_REWARD,
-            "balance": row[0] if row else 0,
+            "balance": balance,
             "week_start": week_start,
             "discord_id": linked[0],
         }
@@ -1355,12 +1522,7 @@ async def bounty_place(data: BountyPlace):
     try:
         begin_immediate(conn)
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.issuer_uuid,))
-        c.execute(
-            "UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=? AND mdragons>=?",
-            (data.amount, data.issuer_uuid, data.amount),
-        )
-        if c.rowcount != 1:
+        if not debit_mdragons(c, data.issuer_uuid, data.amount):
             raise HTTPException(400, "Insufficient dragons")
         c.execute(
             """INSERT INTO bounties (target_uuid, target_name, amount, updated)
@@ -1407,8 +1569,7 @@ async def bounty_claim(data: BountyClaim):
             return {"status": "none", "amount": 0}
 
         c.execute("DELETE FROM bounties WHERE target_uuid=?", (data.target_uuid,))
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.killer_uuid,))
-        c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (amount, data.killer_uuid))
+        credit_mdragons(c, data.killer_uuid, amount)
         c.execute(
             """INSERT INTO bounty_events (event_type, target_uuid, target_name, killer_uuid, killer_name, amount)
                VALUES ('claimed', ?, ?, ?, ?, ?)""",
@@ -1457,17 +1618,19 @@ async def place_order(data: PlaceOrder):
     try:
         begin_immediate(conn)
         c = conn.cursor()
+        owner_uuid = order_owner_uuid(c, data.mc_uuid)
+        item_owner = item_account_for_order_owner(c, owner_uuid)
 
-        if not _debit_item(c, data.mc_uuid, item_key, data.amount):
+        if not _debit_item(c, item_owner, item_key, data.amount):
             raise HTTPException(400, "Insufficient items in vault")
 
         c.execute(
             """INSERT INTO orders (mc_uuid, item, amount, price_per, remaining, side)
                VALUES (?,?,?,?,?,'sell')""",
-            (data.mc_uuid, item_key, data.amount, data.price_per, data.amount),
+            (owner_uuid, item_key, data.amount, data.price_per, data.amount),
         )
         order_id = c.lastrowid
-        _record_order_event(c, "placed", order_id, data.mc_uuid, item_key, data.amount, data.price_per, "sell")
+        _record_order_event(c, "placed", order_id, owner_uuid, item_key, data.amount, data.price_per, "sell")
         match_orders(c, item_key)
         conn.commit()
         return {"status": "order_placed", "order_id": order_id}
@@ -1494,21 +1657,17 @@ async def place_buy_order(data: PlaceOrder):
     try:
         begin_immediate(conn)
         c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-        c.execute(
-            "UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=? AND mdragons>=?",
-            (reserve, data.mc_uuid, reserve),
-        )
-        if c.rowcount != 1:
+        owner_uuid = order_owner_uuid(c, data.mc_uuid)
+        if not debit_mdragons(c, owner_uuid, reserve):
             raise HTTPException(400, "Insufficient 🐉")
 
         c.execute(
             """INSERT INTO orders (mc_uuid, item, amount, price_per, remaining, side)
                VALUES (?,?,?,?,?,'buy')""",
-            (data.mc_uuid, item_key, data.amount, data.price_per, data.amount),
+            (owner_uuid, item_key, data.amount, data.price_per, data.amount),
         )
         order_id = c.lastrowid
-        _record_order_event(c, "placed", order_id, data.mc_uuid, item_key, data.amount, data.price_per, "buy")
+        _record_order_event(c, "placed", order_id, owner_uuid, item_key, data.amount, data.price_per, "buy")
         match_orders(c, item_key)
         conn.commit()
         return {"status": "order_placed", "order_id": order_id}
@@ -1557,18 +1716,18 @@ async def cancel_order(data: CancelOrder):
         c = conn.cursor()
         c.execute("SELECT mc_uuid, item, remaining, price_per, side FROM orders WHERE id=?", (data.order_id,))
         row = c.fetchone()
-        if not row or row[0] != data.mc_uuid:
+        owner_keys = order_owner_keys(c, data.mc_uuid)
+        if not row or row[0] not in owner_keys:
             raise HTTPException(400, "Order not found or not yours")
 
-        item, remaining, price_per, side = row[1], row[2], row[3], row[4]
+        row_owner, item, remaining, price_per, side = row[0], row[1], row[2], row[3], row[4]
         if side == "sell":
-            _credit_item(c, data.mc_uuid, item, remaining)
+            _credit_item(c, item_account_for_order_owner(c, row_owner), item, remaining)
         else:
             refund = remaining * price_per
-            c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-            c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (refund, data.mc_uuid))
+            credit_mdragons(c, row_owner, refund)
 
-        _record_order_event(c, "cancelled", data.order_id, data.mc_uuid, item, remaining, price_per, side)
+        _record_order_event(c, "cancelled", data.order_id, row_owner, item, remaining, price_per, side)
         c.execute("DELETE FROM orders WHERE id=?", (data.order_id,))
         conn.commit()
         return {"status": "cancelled"}
@@ -1588,33 +1747,33 @@ async def cancel_all_orders(data: CancelAll):
     try:
         begin_immediate(conn)
         c = conn.cursor()
+        owner_keys = order_owner_keys(c, data.mc_uuid)
+        placeholders = ",".join("?" for _ in owner_keys)
 
         if data.item:
             item_key = normalize_item(data.item)
             if not item_key:
                 raise HTTPException(400, "Invalid item")
             c.execute(
-                """SELECT id, item, remaining, price_per, side FROM orders
-                   WHERE mc_uuid=? AND item=? AND remaining>0 AND (is_system IS NULL OR is_system=0)""",
-                (data.mc_uuid, item_key),
+                f"""SELECT id, mc_uuid, item, remaining, price_per, side FROM orders
+                   WHERE mc_uuid IN ({placeholders}) AND item=? AND remaining>0 AND (is_system IS NULL OR is_system=0)""",
+                (*owner_keys, item_key),
             )
         else:
             c.execute(
-                """SELECT id, item, remaining, price_per, side FROM orders
-                   WHERE mc_uuid=? AND remaining>0 AND (is_system IS NULL OR is_system=0)""",
-                (data.mc_uuid,),
+                f"""SELECT id, mc_uuid, item, remaining, price_per, side FROM orders
+                   WHERE mc_uuid IN ({placeholders}) AND remaining>0 AND (is_system IS NULL OR is_system=0)""",
+                owner_keys,
             )
 
         rows = c.fetchall()
         cancelled = 0
-        for order_id, item, remaining, price_per, side in rows:
+        for order_id, row_owner, item, remaining, price_per, side in rows:
             if side == "sell":
-                _credit_item(c, data.mc_uuid, item, remaining)
+                _credit_item(c, item_account_for_order_owner(c, row_owner), item, remaining)
             else:
-                c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-                c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?",
-                          (remaining * price_per, data.mc_uuid))
-            _record_order_event(c, "cancelled", order_id, data.mc_uuid, item, remaining, price_per, side)
+                credit_mdragons(c, row_owner, remaining * price_per)
+            _record_order_event(c, "cancelled", order_id, row_owner, item, remaining, price_per, side)
             c.execute("DELETE FROM orders WHERE id=?", (order_id,))
             cancelled += 1
 
@@ -1639,11 +1798,7 @@ async def convert_to_ub(data: ConvertDragons):
     try:
         begin_immediate(conn)
         c = conn.cursor()
-        c.execute(
-            "UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=? AND mdragons>=?",
-            (data.amount, data.mc_uuid, data.amount),
-        )
-        if c.rowcount != 1:
+        if not debit_mdragons(c, data.mc_uuid, data.amount):
             raise HTTPException(400, "Insufficient vault 🐉")
         conn.commit()
         return {"status": "deducted"}
@@ -1664,8 +1819,7 @@ async def convert_to_vault(data: ConvertDragons):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-    c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (data.amount, data.mc_uuid))
+    credit_mdragons(c, data.mc_uuid, data.amount)
     conn.commit()
     conn.close()
     return {"status": "credited"}
@@ -1690,13 +1844,14 @@ async def convert_refund(data: ConvertDragons):
                 existing = c.fetchone()
                 if not existing:
                     raise HTTPException(409, "Refund already processed")
-                if existing[0] != data.mc_uuid or float(existing[1]) != float(data.amount):
+                existing_account = dragon_account_for_uuid(c, existing[0])
+                requested_account = dragon_account_for_uuid(c, data.mc_uuid)
+                if existing_account != requested_account or float(existing[1]) != float(data.amount):
                     raise HTTPException(409, "refund_id already used for a different refund")
                 conn.rollback()
                 return {"status": "refunded", "duplicate": True}
 
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-        c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (data.amount, data.mc_uuid))
+        credit_mdragons(c, data.mc_uuid, data.amount)
         conn.commit()
         return {"status": "refunded", "duplicate": False}
     except HTTPException:
@@ -1711,6 +1866,9 @@ async def convert_refund(data: ConvertDragons):
 
 @app.get("/api/discord_id/{mc_uuid}")
 async def get_discord_id(mc_uuid: str):
+    discord_id = discord_id_from_dragon_account(mc_uuid)
+    if discord_id:
+        return {"discord_id": discord_id}
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT discord_id FROM linked_accounts WHERE mc_uuid=?", (mc_uuid,))
@@ -1725,11 +1883,13 @@ async def get_discord_id(mc_uuid: str):
 async def list_user_orders(mc_uuid: str):
     conn = get_conn()
     c = conn.cursor()
+    owner_keys = order_owner_keys(c, mc_uuid)
+    placeholders = ",".join("?" for _ in owner_keys)
     c.execute(
-        """SELECT id, item, remaining, price_per, side FROM orders
-           WHERE mc_uuid=? AND remaining>0 AND (is_system IS NULL OR is_system=0)
+        f"""SELECT id, item, remaining, price_per, side FROM orders
+           WHERE mc_uuid IN ({placeholders}) AND remaining>0 AND (is_system IS NULL OR is_system=0)
            ORDER BY created DESC""",
-        (mc_uuid,),
+        owner_keys,
     )
     rows = c.fetchall()
     conn.close()
@@ -1746,17 +1906,31 @@ async def top_netherite():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT b.mc_uuid,
-               b.netherite + COALESCE(SUM(
-                   CASE WHEN o.item='NETHERITE_INGOT' AND o.side='sell'
-                             AND o.remaining>0
-                             AND (o.is_system IS NULL OR o.is_system=0)
-                        THEN o.remaining ELSE 0 END
-               ), 0) AS total
-        FROM balances b
-        LEFT JOIN orders o ON b.mc_uuid = o.mc_uuid
-        WHERE b.mc_uuid NOT LIKE 'SYSTEM_%'
-        GROUP BY b.mc_uuid
+        WITH sell_orders AS (
+            SELECT CASE
+                       WHEN o.mc_uuid LIKE 'DISCORD_%' AND la.mc_uuid IS NOT NULL THEN la.mc_uuid
+                       ELSE o.mc_uuid
+                   END AS account_uuid,
+                   SUM(o.remaining) AS listed
+            FROM orders o
+            LEFT JOIN linked_accounts la ON o.mc_uuid = 'DISCORD_' || la.discord_id
+            WHERE o.item='NETHERITE_INGOT'
+              AND o.side='sell'
+              AND o.remaining>0
+              AND (o.is_system IS NULL OR o.is_system=0)
+            GROUP BY account_uuid
+        ),
+        account_keys AS (
+            SELECT mc_uuid AS account_uuid FROM balances WHERE netherite > 0
+            UNION
+            SELECT account_uuid FROM sell_orders
+        )
+        SELECT account_keys.account_uuid,
+               COALESCE(b.netherite, 0) + COALESCE(so.listed, 0) AS total
+        FROM account_keys
+        LEFT JOIN balances b ON b.mc_uuid = account_keys.account_uuid
+        LEFT JOIN sell_orders so ON so.account_uuid = account_keys.account_uuid
+        WHERE account_keys.account_uuid NOT LIKE 'SYSTEM_%'
         ORDER BY total DESC
         LIMIT 1
     """)
@@ -1770,26 +1944,35 @@ async def top_netherite():
 def _dragon_leaderboard(c: sqlite3.Cursor, limit: int, offset: int):
     c.execute(
         """
-        SELECT b.mc_uuid,
-               b.mdragons AS vault,
-               COALESCE(SUM(
-                   CASE WHEN o.side='buy'
-                             AND o.remaining>0
-                             AND (o.is_system IS NULL OR o.is_system=0)
-                        THEN o.remaining * o.price_per ELSE 0 END
-               ), 0) AS locked,
-               b.mdragons + COALESCE(SUM(
-                   CASE WHEN o.side='buy'
-                             AND o.remaining>0
-                             AND (o.is_system IS NULL OR o.is_system=0)
-                        THEN o.remaining * o.price_per ELSE 0 END
-               ), 0) AS total
-        FROM balances b
-        LEFT JOIN orders o ON b.mc_uuid = o.mc_uuid
-        WHERE b.mc_uuid NOT LIKE 'SYSTEM_%'
-        GROUP BY b.mc_uuid
-        HAVING total > 0
-        ORDER BY total DESC, b.mc_uuid ASC
+        WITH locked_orders AS (
+            SELECT CASE
+                       WHEN o.mc_uuid LIKE 'DISCORD_%' THEN o.mc_uuid
+                       WHEN la.discord_id IS NOT NULL THEN 'DISCORD_' || la.discord_id
+                       ELSE o.mc_uuid
+                   END AS account_uuid,
+                   SUM(o.remaining * o.price_per) AS locked
+            FROM orders o
+            LEFT JOIN linked_accounts la ON la.mc_uuid = o.mc_uuid
+            WHERE o.side='buy'
+              AND o.remaining>0
+              AND (o.is_system IS NULL OR o.is_system=0)
+            GROUP BY account_uuid
+        ),
+        account_keys AS (
+            SELECT mc_uuid AS account_uuid FROM balances WHERE mdragons > 0
+            UNION
+            SELECT account_uuid FROM locked_orders
+        )
+        SELECT account_keys.account_uuid,
+               COALESCE(b.mdragons, 0) AS vault,
+               COALESCE(lo.locked, 0) AS locked,
+               COALESCE(b.mdragons, 0) + COALESCE(lo.locked, 0) AS total
+        FROM account_keys
+        LEFT JOIN balances b ON b.mc_uuid = account_keys.account_uuid
+        LEFT JOIN locked_orders lo ON lo.account_uuid = account_keys.account_uuid
+        WHERE account_keys.account_uuid NOT LIKE 'SYSTEM_%'
+          AND COALESCE(b.mdragons, 0) + COALESCE(lo.locked, 0) > 0
+        ORDER BY total DESC, account_keys.account_uuid ASC
         LIMIT ? OFFSET ?
         """,
         (limit, offset),
@@ -1846,18 +2029,32 @@ async def item_leaderboard(item: str, limit: int = Query(10, ge=1, le=50), offse
         col = item_col(item_key)
         c.execute(
             f"""
-            SELECT b.mc_uuid,
-                   b.{col} + COALESCE(SUM(
-                       CASE WHEN o.item=? AND o.side='sell'
-                                 AND o.remaining>0
-                                 AND (o.is_system IS NULL OR o.is_system=0)
-                            THEN o.remaining ELSE 0 END
-                   ), 0) AS total
-            FROM balances b
-            LEFT JOIN orders o ON b.mc_uuid = o.mc_uuid
-            GROUP BY b.mc_uuid
-            HAVING total > 0
-            ORDER BY total DESC, b.mc_uuid ASC
+            WITH sell_orders AS (
+                SELECT CASE
+                           WHEN o.mc_uuid LIKE 'DISCORD_%' AND la.mc_uuid IS NOT NULL THEN la.mc_uuid
+                           ELSE o.mc_uuid
+                       END AS account_uuid,
+                       SUM(o.remaining) AS listed
+                FROM orders o
+                LEFT JOIN linked_accounts la ON o.mc_uuid = 'DISCORD_' || la.discord_id
+                WHERE o.item=?
+                  AND o.side='sell'
+                  AND o.remaining>0
+                  AND (o.is_system IS NULL OR o.is_system=0)
+                GROUP BY account_uuid
+            ),
+            account_keys AS (
+                SELECT mc_uuid AS account_uuid FROM balances WHERE {col} > 0
+                UNION
+                SELECT account_uuid FROM sell_orders
+            )
+            SELECT account_keys.account_uuid,
+                   COALESCE(b.{col}, 0) + COALESCE(so.listed, 0) AS total
+            FROM account_keys
+            LEFT JOIN balances b ON b.mc_uuid = account_keys.account_uuid
+            LEFT JOIN sell_orders so ON so.account_uuid = account_keys.account_uuid
+            WHERE COALESCE(b.{col}, 0) + COALESCE(so.listed, 0) > 0
+            ORDER BY total DESC, account_keys.account_uuid ASC
             LIMIT ? OFFSET ?
             """,
             (item_key, limit, offset),
@@ -1865,22 +2062,37 @@ async def item_leaderboard(item: str, limit: int = Query(10, ge=1, le=50), offse
     else:
         c.execute(
             """
-            SELECT base.mc_uuid,
-                   base.vault + COALESCE(SUM(
-                       CASE WHEN o.item=? AND o.side='sell'
-                                 AND o.remaining>0
-                                 AND (o.is_system IS NULL OR o.is_system=0)
-                            THEN o.remaining ELSE 0 END
-                   ), 0) AS total
-            FROM (
-                SELECT mc_uuid, amount AS vault
+            WITH vaults AS (
+                SELECT mc_uuid AS account_uuid, amount AS vault
                 FROM commodity_balances
                 WHERE commodity=?
-            ) base
-            LEFT JOIN orders o ON base.mc_uuid = o.mc_uuid
-            GROUP BY base.mc_uuid
-            HAVING total > 0
-            ORDER BY total DESC, base.mc_uuid ASC
+            ),
+            sell_orders AS (
+                SELECT CASE
+                           WHEN o.mc_uuid LIKE 'DISCORD_%' AND la.mc_uuid IS NOT NULL THEN la.mc_uuid
+                           ELSE o.mc_uuid
+                       END AS account_uuid,
+                       SUM(o.remaining) AS listed
+                FROM orders o
+                LEFT JOIN linked_accounts la ON o.mc_uuid = 'DISCORD_' || la.discord_id
+                WHERE o.item=?
+                  AND o.side='sell'
+                  AND o.remaining>0
+                  AND (o.is_system IS NULL OR o.is_system=0)
+                GROUP BY account_uuid
+            ),
+            account_keys AS (
+                SELECT account_uuid FROM vaults
+                UNION
+                SELECT account_uuid FROM sell_orders
+            )
+            SELECT account_keys.account_uuid,
+                   COALESCE(v.vault, 0) + COALESCE(so.listed, 0) AS total
+            FROM account_keys
+            LEFT JOIN vaults v ON v.account_uuid = account_keys.account_uuid
+            LEFT JOIN sell_orders so ON so.account_uuid = account_keys.account_uuid
+            WHERE COALESCE(v.vault, 0) + COALESCE(so.listed, 0) > 0
+            ORDER BY total DESC, account_keys.account_uuid ASC
             LIMIT ? OFFSET ?
             """,
             (item_key, item_key, limit, offset),
@@ -1953,13 +2165,16 @@ async def inventory(mc_uuid: str, item: str):
 
     conn = get_conn()
     c = conn.cursor()
-    vault = _get_item_balance(c, mc_uuid, item_key)
+    owner_keys = order_owner_keys(c, mc_uuid)
+    item_owner = item_account_for_order_owner(c, order_owner_uuid(c, mc_uuid))
+    vault = _get_item_balance(c, item_owner, item_key)
+    placeholders = ",".join("?" for _ in owner_keys)
 
     c.execute(
-        """SELECT COALESCE(SUM(remaining), 0) FROM orders
-           WHERE mc_uuid=? AND item=? AND side='sell' AND remaining>0
+        f"""SELECT COALESCE(SUM(remaining), 0) FROM orders
+           WHERE mc_uuid IN ({placeholders}) AND item=? AND side='sell' AND remaining>0
            AND (is_system IS NULL OR is_system=0)""",
-        (mc_uuid, item_key),
+        (*owner_keys, item_key),
     )
     in_orders = c.fetchone()[0]
     conn.close()
@@ -2371,7 +2586,9 @@ async def external_give(data: ExternalGive):
                 existing = c.fetchone()
                 if not existing:
                     raise HTTPException(409, "External credit already processed")
-                if existing[0] != data.mc_uuid or int(existing[1]) != int(data.amount):
+                existing_account = dragon_account_for_uuid(c, existing[0])
+                requested_account = dragon_account_for_uuid(c, data.mc_uuid)
+                if existing_account != requested_account or int(existing[1]) != int(data.amount):
                     raise HTTPException(409, "event_id already used for a different external credit")
                 conn.rollback()
                 return {
@@ -2381,8 +2598,7 @@ async def external_give(data: ExternalGive):
                     "duplicate": True,
                 }
 
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-        c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (data.amount, data.mc_uuid))
+        credit_mdragons(c, data.mc_uuid, data.amount)
         conn.commit()
         return {
             "status": "credited",
@@ -2523,9 +2739,7 @@ async def fill_purchase_list(data: FillPurchaseList):
             if current < qty - 1e-9:
                 raise HTTPException(400, f"Insufficient {item_key} in vault (need {qty})")
 
-        c.execute("SELECT mdragons FROM balances WHERE mc_uuid=?", (buyer_uuid,))
-        br = c.fetchone()
-        if not br or br[0] < price:
+        if get_mdragon_balance(c, buyer_uuid) < price:
             raise HTTPException(400, "The buyer does not have enough 🐉 to pay for this list")
 
         for item_key, qty in items.items():
@@ -2533,9 +2747,9 @@ async def fill_purchase_list(data: FillPurchaseList):
                 raise HTTPException(400, f"Insufficient {item_key} in vault")
             _credit_item(c, buyer_uuid, item_key, qty)
 
-        c.execute("UPDATE balances SET mdragons=mdragons-? WHERE mc_uuid=?", (price, buyer_uuid))
-        c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
-        c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (price, data.mc_uuid))
+        if not debit_mdragons(c, buyer_uuid, price):
+            raise HTTPException(400, "The buyer does not have enough dragons to pay for this list")
+        credit_mdragons(c, data.mc_uuid, price)
 
         total_qty = sum(items.values())
         if total_qty > 0:
