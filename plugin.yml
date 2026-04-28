@@ -12,7 +12,7 @@ commands:
     description: Deposit any commodity item into your vault
     usage: /deposit <item> <amount|all> or /deposit inv
     # Accepts Minecraft item names (iron_ingot, oak_log, red_wool, diamond_block...) and xp.
-    # Blocks are converted into item units where reversible, e.g. 1 iron_block = 9 iron ingots.
+    # Coal, iron, gold, and emerald are stored as blocks; ingots/items convert into block fractions.
 
   withdraw:
     description: Withdraw any commodity from your vault
@@ -39,6 +39,10 @@ commands:
     description: Place a dragon bounty on a player
     usage: /bounty <playername> <dragons>
     aliases: [bouny]
+
+  bounties:
+    description: Show active dragon bounties
+    usage: /bounties [page]
 
   helpmc:
     description: Show item name help and categories for deposit/withdraw

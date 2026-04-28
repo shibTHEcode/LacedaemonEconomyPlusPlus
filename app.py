@@ -10,33 +10,12 @@ import uuid as pyuuid
 from zoneinfo import ZoneInfo
 import json
 import os
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENV LOADING
-# ─────────────────────────────────────────────────────────────────
-def _load_env_file(path: str | None = None) -> None:
-    """Load KEY=VALUE pairs from .env without requiring python-dotenv."""
-    env_path = path or os.environ.get("ENV_FILE", ".env")
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
-    except FileNotFoundError:
-        pass
-
-
-_load_env_file()
+import secrets
 
 app = FastAPI()
 DB_PATH = os.environ.get("DB_PATH", "/app/data/mdragons.db")
 API_KEY = os.environ.get("API_KEY", "").strip()
+PUBLIC_API_PATHS = {"/api/health"}
 GERMAN_TZ = ZoneInfo("Europe/Berlin")
 logger = logging.getLogger("mdragons.app")
 
@@ -102,6 +81,32 @@ def get_conn() -> sqlite3.Connection:
 def begin_immediate(conn: sqlite3.Connection):
     conn.isolation_level = None
     conn.execute("BEGIN IMMEDIATE")
+
+
+def format_compact_amount(value: float):
+    number = float(value or 0)
+    return int(number) if number.is_integer() else round(number, 2)
+
+
+def backup_sqlite_database(prefix: str) -> dict:
+    src = os.path.abspath(DB_PATH)
+    if not os.path.exists(src):
+        raise HTTPException(500, "Database file does not exist")
+
+    backup_dir = os.path.join(os.path.dirname(src), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = os.path.join(backup_dir, f"{prefix}-{stamp}.db")
+
+    source = sqlite3.connect(src, timeout=30)
+    target = sqlite3.connect(dest)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+    return {"path": dest, "bytes": os.path.getsize(dest)}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -269,9 +274,12 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
         issuer_uuid TEXT,
+        target_name TEXT,
         target_uuid TEXT,
+        killer_name TEXT,
         killer_uuid TEXT,
         amount REAL NOT NULL,
+        logged INTEGER NOT NULL DEFAULT 0,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
@@ -300,19 +308,34 @@ def init_db():
         c.execute("ALTER TABLE orders ADD COLUMN is_system INTEGER DEFAULT 0")
         c.execute("UPDATE orders SET is_system=0 WHERE is_system IS NULL")
 
+    c.execute("PRAGMA table_info(bounty_events)")
+    bounty_cols = [col[1] for col in c.fetchall()]
+    if "target_name" not in bounty_cols:
+        c.execute("ALTER TABLE bounty_events ADD COLUMN target_name TEXT")
+    if "killer_name" not in bounty_cols:
+        c.execute("ALTER TABLE bounty_events ADD COLUMN killer_name TEXT")
+    if "logged" not in bounty_cols:
+        c.execute("ALTER TABLE bounty_events ADD COLUMN logged INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
     conn.close()
 
 
 @app.on_event("startup")
 async def startup():
+    if not API_KEY:
+        raise RuntimeError("API_KEY is not set; refusing to start with unprotected /api endpoints")
     init_db()
 
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    if API_KEY and request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
-        if request.headers.get("X-API-Key") != API_KEY:
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
+        supplied_key = request.headers.get("X-API-Key", "")
+        if not API_KEY:
+            return JSONResponse(status_code=503, content={"detail": "API key is not configured"})
+        if not secrets.compare_digest(supplied_key, API_KEY):
             return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
     return await call_next(request)
 
@@ -887,6 +910,11 @@ class BountyClaim(BaseModel):
     killer_name: str
 
 
+class BackupRequest(BaseModel):
+    requested_by: Optional[str] = None
+    reason: Optional[str] = None
+
+
 class SetPause(BaseModel):
     paused: bool
     paused_by: Optional[str] = None
@@ -1009,6 +1037,7 @@ async def adjust_balance(data: AdjustBalance):
     try:
         begin_immediate(conn)
         c = conn.cursor()
+        old_balance = _get_item_balance(c, data.mc_uuid, item_key)
         if data.delta >= 0:
             if is_legacy_item(item_key):
                 c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.mc_uuid,))
@@ -1018,7 +1047,13 @@ async def adjust_balance(data: AdjustBalance):
                 raise HTTPException(400, "Insufficient balance")
         new_balance = _get_item_balance(c, data.mc_uuid, item_key)
         conn.commit()
-        return {"status": "adjusted", "item": item_key, "delta": data.delta, "new_balance": new_balance}
+        return {
+            "status": "adjusted",
+            "item": item_key,
+            "delta": data.delta,
+            "old_balance": old_balance,
+            "new_balance": new_balance,
+        }
     except HTTPException:
         conn.rollback()
         raise
@@ -1125,6 +1160,38 @@ async def get_mc_uuid_endpoint(discord_id: str):
     if not row:
         raise HTTPException(404, "Account not linked")
     return {"mc_uuid": row[0]}
+
+
+@app.get("/api/health")
+async def health():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1")
+        c.fetchone()
+        c.execute("SELECT COUNT(*) FROM balances")
+        balances_count = c.fetchone()[0]
+        return {
+            "status": "ok",
+            "db_path": DB_PATH,
+            "balances": balances_count,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/backup")
+async def admin_backup(data: BackupRequest):
+    backup = backup_sqlite_database("mdragons")
+
+    return {
+        "status": "backed_up",
+        "path": backup["path"],
+        "bytes": backup["bytes"],
+        "requested_by": data.requested_by,
+        "reason": data.reason,
+    }
 
 
 @app.post("/api/alive/report")
@@ -1235,6 +1302,48 @@ async def alive_leaderboard_text(limit: int = Query(10, ge=1, le=20), offset: in
     )
 
 
+@app.get("/api/bounties")
+async def list_bounties(limit: int = Query(10, ge=1, le=50), offset: int = Query(0, ge=0)):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """SELECT target_uuid, COALESCE(target_name, target_uuid), amount, updated
+           FROM bounties
+           WHERE amount > 0
+           ORDER BY amount DESC, updated DESC, target_uuid ASC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return {
+        "offset": offset,
+        "limit": limit,
+        "entries": [
+            {
+                "rank": offset + idx + 1,
+                "target_uuid": row[0],
+                "target_name": row[1],
+                "amount": round(row[2], 2),
+                "updated": row[3],
+            }
+            for idx, row in enumerate(rows)
+        ],
+    }
+
+
+@app.get("/api/bounties_text", response_class=PlainTextResponse)
+async def bounties_text(limit: int = Query(10, ge=1, le=20), offset: int = Query(0, ge=0)):
+    data = await list_bounties(limit=limit, offset=offset)
+    entries = data["entries"]
+    if not entries:
+        return "No active bounties."
+    return "\n".join(
+        f"#{e['rank']} {e['target_name']} - {format_compact_amount(e['amount'])} dragons"
+        for e in entries
+    )
+
+
 @app.post("/api/bounty/place")
 async def bounty_place(data: BountyPlace):
     if data.amount <= 0:
@@ -1263,9 +1372,9 @@ async def bounty_place(data: BountyPlace):
             (data.target_uuid, data.target_name[:32], data.amount),
         )
         c.execute(
-            """INSERT INTO bounty_events (event_type, issuer_uuid, target_uuid, amount)
-               VALUES ('placed', ?, ?, ?)""",
-            (data.issuer_uuid, data.target_uuid, data.amount),
+            """INSERT INTO bounty_events (event_type, issuer_uuid, target_uuid, target_name, amount)
+               VALUES ('placed', ?, ?, ?, ?)""",
+            (data.issuer_uuid, data.target_uuid, data.target_name[:32], data.amount),
         )
         c.execute("SELECT amount FROM bounties WHERE target_uuid=?", (data.target_uuid,))
         total = c.fetchone()[0]
@@ -1301,14 +1410,14 @@ async def bounty_claim(data: BountyClaim):
         c.execute("INSERT OR IGNORE INTO balances (mc_uuid) VALUES (?)", (data.killer_uuid,))
         c.execute("UPDATE balances SET mdragons=mdragons+? WHERE mc_uuid=?", (amount, data.killer_uuid))
         c.execute(
-            """INSERT INTO bounty_events (event_type, target_uuid, killer_uuid, amount)
-               VALUES ('claimed', ?, ?, ?)""",
-            (data.target_uuid, data.killer_uuid, amount),
+            """INSERT INTO bounty_events (event_type, target_uuid, target_name, killer_uuid, killer_name, amount)
+               VALUES ('claimed', ?, ?, ?, ?, ?)""",
+            (data.target_uuid, data.target_name[:32], data.killer_uuid, data.killer_name[:32], amount),
         )
         conn.commit()
         return {
             "status": "claimed",
-            "amount": int(amount) if amount.is_integer() else round(amount, 2),
+            "amount": format_compact_amount(amount),
             "target_name": data.target_name[:32],
             "killer_name": data.killer_name[:32],
         }
@@ -1646,6 +1755,7 @@ async def top_netherite():
                ), 0) AS total
         FROM balances b
         LEFT JOIN orders o ON b.mc_uuid = o.mc_uuid
+        WHERE b.mc_uuid NOT LIKE 'SYSTEM_%'
         GROUP BY b.mc_uuid
         ORDER BY total DESC
         LIMIT 1
@@ -1655,6 +1765,71 @@ async def top_netherite():
     if not row or row[1] == 0:
         return {"mc_uuid": None, "total": 0}
     return {"mc_uuid": row[0], "total": row[1]}
+
+
+def _dragon_leaderboard(c: sqlite3.Cursor, limit: int, offset: int):
+    c.execute(
+        """
+        SELECT b.mc_uuid,
+               b.mdragons AS vault,
+               COALESCE(SUM(
+                   CASE WHEN o.side='buy'
+                             AND o.remaining>0
+                             AND (o.is_system IS NULL OR o.is_system=0)
+                        THEN o.remaining * o.price_per ELSE 0 END
+               ), 0) AS locked,
+               b.mdragons + COALESCE(SUM(
+                   CASE WHEN o.side='buy'
+                             AND o.remaining>0
+                             AND (o.is_system IS NULL OR o.is_system=0)
+                        THEN o.remaining * o.price_per ELSE 0 END
+               ), 0) AS total
+        FROM balances b
+        LEFT JOIN orders o ON b.mc_uuid = o.mc_uuid
+        WHERE b.mc_uuid NOT LIKE 'SYSTEM_%'
+        GROUP BY b.mc_uuid
+        HAVING total > 0
+        ORDER BY total DESC, b.mc_uuid ASC
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    )
+    return c.fetchall()
+
+
+@app.get("/api/top_dragons")
+async def top_dragons():
+    conn = get_conn()
+    c = conn.cursor()
+    rows = _dragon_leaderboard(c, 1, 0)
+    conn.close()
+    if not rows:
+        return {"mc_uuid": None, "total": 0}
+    row = rows[0]
+    return {"mc_uuid": row[0], "vault": round(row[1], 2), "locked": round(row[2], 2), "total": round(row[3], 2)}
+
+
+@app.get("/api/leaderboard_dragons")
+async def dragon_leaderboard(limit: int = Query(10, ge=1, le=50), offset: int = Query(0, ge=0)):
+    conn = get_conn()
+    c = conn.cursor()
+    rows = _dragon_leaderboard(c, limit, offset)
+    conn.close()
+    return {
+        "item": "DAEMON",
+        "offset": offset,
+        "limit": limit,
+        "entries": [
+            {
+                "rank": offset + idx + 1,
+                "mc_uuid": row[0],
+                "vault": round(row[1], 2),
+                "locked": round(row[2], 2),
+                "total": round(row[3], 2),
+            }
+            for idx, row in enumerate(rows)
+        ],
+    }
 
 
 @app.get("/api/leaderboard/{item}")
@@ -2133,6 +2308,47 @@ async def get_pending_trade_event_logs():
             for r in rows
         ]
     }
+
+
+@app.get("/api/log/bounty_events/pending")
+async def get_pending_bounty_event_logs():
+    conn = get_conn()
+    try:
+        begin_immediate(conn)
+        c = conn.cursor()
+        c.execute(
+            """SELECT id, event_type, issuer_uuid, target_uuid, target_name,
+                      killer_uuid, killer_name, amount, timestamp
+               FROM bounty_events
+               WHERE logged=0
+               ORDER BY id"""
+        )
+        rows = c.fetchall()
+        if rows:
+            ids = [r[0] for r in rows]
+            c.execute(f"UPDATE bounty_events SET logged=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
+        conn.commit()
+        return {
+            "entries": [
+                {
+                    "id": r[0],
+                    "event_type": r[1],
+                    "issuer_uuid": r[2],
+                    "target_uuid": r[3],
+                    "target_name": r[4],
+                    "killer_uuid": r[5],
+                    "killer_name": r[6],
+                    "amount": r[7],
+                    "timestamp": r[8],
+                }
+                for r in rows
+            ]
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @app.post("/api/external/give")

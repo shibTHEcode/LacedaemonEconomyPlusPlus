@@ -1,311 +1,409 @@
-# MDragons Economy — GitHub-safe setup
+# Lacedaemon Economy++
 
-This repository contains the Minecraft plugin, Discord bot, and FastAPI backend for the MDragons Economy / Economy++ system. This copy is sanitized for GitHub: real secrets and private runtime values should live in environment variables, not in committed source code.
+> Minecraft vault economy + Discord markets + DAEMON convergence protocol.
+
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-backend-009688)
+![Paper](https://img.shields.io/badge/Paper%2FSpigot-1.21-orange)
+![Security](https://img.shields.io/badge/GitHub--safe-no%20secrets-success)
+
+Lacedaemon Economy++ connects a Minecraft server, a Discord community, and a lightweight SQLite ledger into one server economy.
+
+It has two separate economic layers:
+
+- **Economy++ Dragons** — the normal server currency used for vault balances, item markets, bounties, role redemptions, purchase lists, and DAEMON pricing.
+- **DAEMON** — a separate capped-supply coordination token with transfers, a market, governance, and the convergence arena described in `Daemon Whitepaper.pdf`.
+
+This repository is designed to be public-safe: real tokens, API keys, Discord IDs, channel IDs, role IDs, and seed balances belong in environment variables, not committed source.
+
+---
+
+## What is included
+
+| File | Purpose |
+|---|---|
+| `app.py` | FastAPI backend, SQLite ledger, vault balances, order books, bounties, logs, linking, mechanics, and backups. |
+| `bot.py` | Discord bot for Economy++, markets, purchase lists, DAEMON, arena, governance, role automation, and admin tools. |
+| `MDragonsEconomy.java` | Paper/Spigot plugin for Minecraft deposits, withdrawals, balances, linking, alive tracking, and bounties. |
+| `plugin.yml` | Bukkit/Paper command registration. |
+| `Daemon Whitepaper.pdf` | Long-form DAEMON protocol description. |
+| `.env.example` | Safe configuration template. |
+| `.gitignore` | Keeps secrets, databases, caches, and build outputs out of Git. |
+
+---
+
+## Security model
+
+The backend API is internal infrastructure. Treat it like an admin service.
+
+This GitHub-safe update makes these security assumptions explicit:
+
+1. `API_KEY` is required for `app.py`.
+2. Every `/api/...` backend route is protected with `X-API-Key`, except `/api/health`.
+3. The Minecraft plugin no longer has a hardcoded fallback API key.
+4. The Discord bot refuses to start without both `DISCORD_TOKEN` and `API_KEY`.
+5. Discord role IDs, channel IDs, admin IDs, relay bot IDs, and DAEMON initial balances are loaded from environment variables.
+
+Never commit:
+
+- `.env`
+- Discord bot tokens
+- API keys
+- SQLite files such as `*.db`, `*.sqlite`, `*.sqlite3`
+- built plugin jars unless they are intentional release artifacts
+- Python cache folders
+- server-private role/channel/admin IDs if you do not want them public
+
+If a real token or API key was ever shared or committed, rotate it before deploying this version.
+
+---
 
 ## Quick start
 
-1. Copy `.env.example` to `.env`.
-2. Fill in your real Discord token, API key, role IDs, channel IDs, admin IDs, bot IDs, and database paths.
-3. Keep `.env` private. It is intentionally ignored by `.gitignore`.
-4. Start the FastAPI backend first, then the Discord bot, then point the Minecraft plugin at the backend.
-
-## Important files
-
-- `bot.py` — Discord bot for Economy++ Dragons, item markets, purchase lists, Daemon, arena, and governance.
-- `app.py` — FastAPI backend and SQLite ledger for vault balances, markets, links, logs, bounties, and mechanics.
-- `MDragonsEconomy.java` — Paper/Spigot plugin for Minecraft vault deposit, withdrawal, balance, bounties, and Discord linking.
-- `plugin.yml` — Bukkit command registration.
-- `.env.example` — safe placeholder configuration template.
-- `.gitignore` — prevents `.env`, databases, caches, build artifacts, and `.jar` files from being committed.
-
-## Environment setup
-
-### Python services
-
-The Python services read values from environment variables. Use `.env.example` as the template:
+### 1. Create your environment file
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` and provide the real values for your server.
+Edit `.env` and fill in the real values for your server.
 
-### Java plugin
+Generate a strong API key, for example:
 
-The Java plugin does not automatically parse `.env` by itself. Set these variables in your host, Docker container, or server startup script:
+```bash
+python - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+```
+
+Use the same `API_KEY` for:
+
+- the FastAPI backend;
+- the Discord bot;
+- the Minecraft plugin runtime environment.
+
+### 2. Start the backend
+
+```bash
+export API_KEY="replace-with-a-long-random-value"
+export DB_PATH="/app/data/mdragons.db"
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+Health check:
+
+```bash
+curl http://localhost:8000/api/health
+```
+
+Protected route check:
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/orders
+```
+
+### 3. Start the Discord bot
+
+```bash
+export DISCORD_TOKEN="your-discord-bot-token"
+export API_KEY="same-api-key-as-backend"
+export BACKEND_URL="http://mdragons-backend:8000/api"
+python bot.py
+```
+
+### 4. Run the Minecraft plugin
+
+The Java plugin reads environment variables from the server process or container. It does **not** parse `.env` by itself.
+
+Set these in your host, Docker container, or startup script:
 
 ```bash
 export BACKEND_URL="http://your-backend-host:8000/api"
-export API_KEY="your-real-api-key"
+export API_KEY="same-api-key-as-backend"
 ```
 
-The plugin sends the API key as `X-API-Key` for protected backend requests.
+Then place the compiled plugin jar in your server's `plugins/` folder.
 
-## Normal Dragons currency: Economy++ 🐉
+---
 
-The normal Dragons currency is the main Economy++ vault currency shown as `🐉`. In the backend it is stored as `mdragons`, and it is different from `DAEMON`.
+## Environment variables
 
-Dragons are used for the normal server economy:
+### Required
 
-- buying items from the item order book;
-- receiving payments from item sales and purchase lists;
-- transferring vault currency to other linked users;
-- placing bounties;
-- redeeming role rewards;
-- cashout role unlocks;
+| Variable | Used by | Purpose |
+|---|---|---|
+| `DISCORD_TOKEN` | `bot.py` | Discord bot token. |
+| `API_KEY` | `app.py`, `bot.py`, Java plugin | Shared backend API key sent as `X-API-Key`. |
+
+### Backend and database
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `DB_PATH` | `/app/data/mdragons.db` | Economy++ backend SQLite database. |
+| `DAEMON_DB_PATH` | `/app/data/daemon.db` | DAEMON SQLite database used by the Discord bot. |
+| `BACKEND_URL` | `http://mdragons-backend:8000/api` | Backend URL used by bot/plugin. |
+
+### Discord IDs
+
+Set these to your real server values in `.env`.
+
+| Variable | Purpose |
+|---|---|
+| `CASHOUT_ROLE_ID` | First cashout role. |
+| `TEN_CASHOUT_ROLE_ID` | Higher cashout role. |
+| `MDRAGONS_ROLE_ID` | MDragons redemption role. |
+| `TEN_MDRAGONS_ROLE_ID` | 10× MDragons redemption role. |
+| `CHAIRMAN_ROLE_ID` | Market governance/chairman role. |
+| `MANSA_MUSA_ROLE_ID` | Top total Dragons role. |
+| `NETHERITE_OVERLORD_ROLE_ID` | Top netherite holder role. |
+| `SATOSHI_NAKAMOTO_ROLE_ID` | Claimed top DAEMON holder role. |
+| `ANNOUNCEMENT_CHANNEL_ID` | Economy announcement channel. |
+| `TRANSACTION_LOG_CHANNEL_ID` | General transaction log channel. |
+| `DEPOSIT_LOG_CHANNEL_ID` | Deposit/withdraw log channel. |
+| `TRADE_LOG_CHANNEL_ID` | Trade log channel. |
+| `EXTERNAL_ECONOMY_LOG_ID` | External economy scanner/log channel. |
+| `COMMIT_LOG_CHANNEL_ID` | DAEMON arena commit log channel. |
+| `DAEMON_TRANSACTION_CHANNEL_ID` | DAEMON public transaction channel. |
+| `ARENA_CHANNEL_ID` | DAEMON arena dashboard channel. |
+| `ADMIN_USER_ID` | Hidden DAEMON supply/admin report user. |
+| `GAMEFIX_USER_ID` | Restricted arena fix/cancel/force-start user. |
+| `PAUSE_INJECTION_USER_ID` | User allowed to pause/resume market injection and adjust Dragons. |
+| `UNBELIEVABOAT_BOT_ID` | External bot ID used for legacy exchange detection. |
+| `EXTERNAL_ECONOMY_BOT_ID` | External Economy++ relay/scanner bot ID. |
+| `EXTERNAL_ECONOMY_SCANNER` | External economy scanner channel/user setting used by the bot. |
+| `PREFIX_COMMAND_BOT_IDS` | Comma-separated bot IDs allowed to issue relay prefix commands. |
+| `COMMAND_SYNC_GUILD_IDS` | Optional comma-separated guild IDs for command sync. |
+| `SYNC_COMMANDS_TO_GUILDS` | Set to `0` to disable startup guild command sync. |
+| `DAEMON_EMOJI` | Optional DAEMON display string or custom Discord emoji. |
+
+### DAEMON seed balances
+
+Use this only when creating a fresh DAEMON database.
+
+```bash
+DAEMON_INITIAL_BALANCES='{"123":7200,"456":3600}'
+```
+
+Existing databases are not overwritten by this value.
+
+---
+
+## Economy++ Dragons
+
+Dragons are the normal server economy currency. In the backend they are stored as `balances.mdragons`.
+
+Dragons are used for:
+
+- buying and selling vaulted Minecraft items;
+- filling purchase lists;
+- giving Dragons to linked users;
+- placing and claiming bounties;
+- role redemption and cashout flows;
 - pricing DAEMON trades.
 
-A player's vault balance can have three useful views:
+A player can have:
 
-- `🐉 Vault` — spendable Dragons currently in the player vault.
-- `🐉 Locked in orders` — Dragons reserved in open buy orders.
-- `🐉 Total` — vault plus locked Dragons.
+| Balance view | Meaning |
+|---|---|
+| Vault Dragons | Spendable Dragons currently in the Economy++ vault. |
+| Locked Dragons | Dragons reserved in open buy orders. |
+| Total Dragons | Vault Dragons + locked Dragons. |
 
-Important distinction:
+The Mansa Musa role uses total Dragons. Netherite Overlord uses vault netherite plus netherite locked in open sell orders.
 
-- `🐉 Dragons / MDragons / Economy++` are the normal server currency.
-- `DAEMON` is a separate capped-supply token with its own balance ledger, arena, governance, and market.
-- DAEMON can be traded against Dragons, so DAEMON prices are shown in `🐉`.
+---
 
-## Daemon summary
+## Minecraft vault
 
-Daemon is the separate scarcity and coordination token. It has a hard cap of `21,000,000` units, begins with a daily arena emission of `7,200`, and reduces daily emission by `0.9×` at defined thresholds and yearly cycles.
+The Minecraft plugin lets players deposit items into the backend vault and withdraw them later.
 
-The Daemon arena is a recurring Rock/Paper/Scissors-style convergence game. Users commit DAEMON to one or more choices. Commitments are final. At resolution, the smallest pool receives half of that cycle's emission, while the two larger pools fight by cyclic dominance for the other half. Winning-pool payouts use power-1.5 weighting, so larger concentrated commitments receive proportionally more.
+Some items use converted base units:
 
-Governance lets users submit proposals with a required yes-weight threshold. It is designed so the protocol can evolve if the participating base reaches sufficient agreement.
+| Minecraft item | Vault unit |
+|---|---|
+| `iron_block` | `1 iron` |
+| `iron_ingot` | `1/9 iron` |
+| `gold_block` | `1 gold` |
+| `gold_ingot` | `1/9 gold` |
+| `gold_nugget` | `1/81 gold` |
+| `diamond_block` | `9 diamond` |
+| `netherite_scrap` | Converts 4 scrap to 1 netherite ingot. |
+| `xp` | Stored as XP amount. |
+
+Most other supported commodities are stored in `commodity_balances`.
+
+---
+
+## Markets
+
+Markets are limit order books, not a central shop.
+
+| Order type | What is locked |
+|---|---|
+| Sell order | Vaulted item amount. |
+| Buy order | Dragons equal to `amount × price_per`. |
+
+Matching is handled by the backend inside transaction-style critical sections. Filled trades are logged for Discord relay.
+
+Prefix commands such as `!buy`, `!sell`, `!cancel`, and `!give` still exist for compatibility. Bot-authored relay prefix commands are accepted only from IDs in `PREFIX_COMMAND_BOT_IDS`.
+
+---
+
+## DAEMON
+
+DAEMON is separate from Dragons.
+
+The whitepaper defines DAEMON as a capped-supply digital asset for direct transfers and high-stakes collective coordination. The current protocol summary:
+
+- hard maximum supply: `21,000,000 DAEMON`;
+- initial daily arena emission: `7,200 DAEMON`;
+- emission reduction factor: `0.9×` at defined thresholds and yearly cycles;
+- direct ledger transfers;
+- a DAEMON/Dragon order book;
+- a recurring Rock/Paper/Scissors convergence arena;
+- irreversible commitments;
+- power-1.5 reward weighting;
+- governance proposals and voting.
+
+### Arena resolution
+
+Each convergence cycle has three pools:
+
+- Rock
+- Paper
+- Scissors
+
+Resolution:
+
+1. Rank pools by total committed DAEMON.
+2. The smallest pool receives half of the cycle emission.
+3. The largest and second-largest pools fight by normal Rock/Paper/Scissors dominance.
+4. The winner of that fight receives the other half.
+5. Winning-pool participants split their tranche by power-1.5 weighting.
+
+Payout formula:
+
+```text
+share = commit^1.5 / sum(winning_pool_commit^1.5) * pool_reward
+```
+
+---
 
 ## Command reference
 
-### Minecraft plugin commands
+### Minecraft commands
 
 | Command | Purpose |
 |---|---|
-| `/discord` | Generates a 6-digit code for linking Minecraft to Discord. Use the code with `/economy link`. |
-| `/deposit <item> <amount\|all>` | Deposits a supported item from inventory into the vault. Supports item names like `iron_ingot`, `oak_log`, `red_wool`, `diamond_block`, and `xp`. |
-| `/deposit inv` | Deposits every supported item in your inventory. |
-| `/withdraw <item> <amount> [variant]` | Withdraws a vaulted item back into Minecraft. Variant is used for color/wood commodities, such as `overworld_log 10 oak` or `wool 16 red`. |
-| `/balance` | Shows full vault balance across Dragons, legacy items, and commodities. |
-| `/balance <item>` | Opens the item balance GUI for one item. |
-| `/itemgui <item>` | Opens a GUI for one item balance. Alias: `/itembalance`. |
-| `/alive [page]` | Shows the Minecraft-days-alive leaderboard. |
-| `/bounty <playername> <dragons>` | Places a Dragon bounty on a Minecraft player. Alias: `/bouny`. |
-| `/helpmc [category]` | Shows deposit/withdraw item help. Categories: `ores`, `wood`, `farming`, `mob`, `blocks`, `nether`, `end`, `color`, `misc`. |
+| `/discord` | Generate a six-digit link code. |
+| `/deposit <item> <amount|all>` | Deposit a supported item or XP. |
+| `/deposit inv` | Deposit all supported inventory items. |
+| `/withdraw <item> <amount> [variant]` | Withdraw vaulted items or XP. |
+| `/balance [item]` | Show vault balance or open item GUI. |
+| `/itemgui <item>` | Open a balance GUI for one item. |
+| `/alive [page]` | Show Minecraft-days-alive leaderboard. |
+| `/bounty <playername> <dragons>` | Place a Dragon bounty. |
+| `/bounties [page]` | Show active Dragon bounties. |
+| `/helpmc [category]` | Show supported item help. |
 
 ### Discord Economy++ commands
 
 | Command | Purpose |
 |---|---|
-| `/economy link <code>` | Links Discord to Minecraft using the code from `/discord`. |
-| `/economy balance` | Shows vault balance, including items, spendable Dragons, locked Dragons, and total Dragons. |
-| `/economy leaderboard <item> [page]` | Shows a leaderboard for a non-dragon item such as `netherite`, `diamond`, `iron`, `dirt`, or `wool`. |
-| `/economy give <user> <amount>` | Sends `🐉` from your Economy++ vault to another linked user. |
-| `/economy inventory <item>` | Shows your total, available, and in-market amount for one item. |
-| `/economy cashout` | Spends Dragons to unlock the configured cashout role tier, if eligible. |
-| `/economy mdragons` | Redeems the configured MDragons role for Dragons added to your vault. |
-| `/economy 10mdragons` | Redeems the configured 10× MDragons role for Dragons added to your vault. |
+| `/economy link <code>` | Link Discord to Minecraft. |
+| `/economy balance` | Show vault, locked, and total balances. |
+| `/economy leaderboard <item> [page]` | Show item or Dragon leaderboards. |
+| `/economy bounties [page]` | Show active bounties. |
+| `/economy give <user> <amount>` | Send Dragons to another linked user. |
+| `/economy inventory <item>` | Show vault and market inventory for one item. |
+| `/economy cashout` | Spend Dragons for configured cashout role. |
+| `/economy mdragons` | Redeem configured MDragons role. |
+| `/economy 10mdragons` | Redeem configured 10× MDragons role. |
+| `/economy health` | Admin health check. |
+| `/economy backup [reason]` | Admin database backup. |
 
 ### Discord market commands
 
-These commands trade vaulted Minecraft items for normal Dragons (`🐉`).
+| Command | Purpose |
+|---|---|
+| `/market view <item> [spread]` | Show order book. |
+| `/market sell <item_type> <amount> <price_per>` | Place sell order. |
+| `/market buy <item_type> <amount> <price_per>` | Place buy order. |
+| `/market orders [page]` | Show your open orders. |
+| `/market cancel <order_id>` | Cancel one order. |
+| `/market cancel_all [item]` | Cancel all orders, optionally for one item. |
+| `/market status` | Show market mechanics. |
+| `/market choose <diamond|netherite>` | Role-holder market choice. |
+| `/market set_injection_cap <raise|lower>` | Chairman cap adjustment. |
+| `/market injectioncaprange <minimum> <maximum>` | Chairman cap bounds. |
+| `/market pause_injection <pause|resume>` | Admin pause/resume injection. |
+
+### Discord DAEMON commands
 
 | Command | Purpose |
 |---|---|
-| `/market view <item> [spread]` | Shows the live order book for an item. Optional `spread` groups prices into wider levels. |
-| `/market sell <item_type> <amount> <price_per>` | Lists vaulted items for sale at a Dragon price per unit. |
-| `/market buy <item_type> <amount> <price_per>` | Places a limit buy order. Dragons are reserved until filled or cancelled. |
-| `/market orders [page]` | Shows your active buy and sell orders. |
-| `/market cancel <order_id>` | Cancels one open order and returns reserved items or Dragons. |
-| `/market cancel_all [item]` | Cancels all your orders, or all orders for one item if `item` is supplied. |
-| `/market status` | Shows the current special market mechanics and liquidity injection state. |
-| `/market choose <diamond\|netherite>` | Mansa Musa / Netherite Overlord command to lock the next weekly market target. |
-| `/market set_injection_cap <raise\|lower>` | Chairman command to raise or lower the weekly liquidity injection cap by `50,000 🐉`. |
-| `/market injectioncaprange <minimum> <maximum>` | Chairman command to set the allowed weekly injection-cap range. |
-| `/market pause_injection <pause\|resume>` | Admin command to pause or resume liquidity injection. |
+| `/daemon balance` | Show DAEMON balance privately. |
+| `/daemon send <user> <amount> [hidden] [message]` | Transfer DAEMON. |
+| `/daemon stats` | Show supply and emission stats. |
+| `/daemon info` | Show DAEMON guide. |
+| `/daemon split <amount>` | Commit equally to all arena choices. |
+| `/daemon dailysplit <amount>` | Auto-commit equally each convergence. |
+| `/daemon market` | Show DAEMON/Dragon order book. |
+| `/daemon sell <amount> <price_per>` | List DAEMON for Dragons. |
+| `/daemon buy <amount> <price_per>` | Bid for DAEMON using Dragons. |
+| `/daemon orders` | Show DAEMON orders. |
+| `/daemon cancel_order <order_id>` | Cancel DAEMON order. |
 
-### Discord purchase-list commands
-
-Purchase lists let one player offer a total Dragon payout for a bundle of items, and another player instantly fills the list if they have all required items.
+### Arena and governance
 
 | Command | Purpose |
 |---|---|
-| `/lists create <name> <price> <items>` | Creates a purchase list. Example items format: `diamond:100,netherite:5`. |
-| `/lists mine` | Shows your active purchase lists. |
-| `/lists all` | Shows all open purchase lists. |
-| `/lists delete <list_id>` | Deletes one of your purchase lists. |
-| `/lists fill <list_id>` | Instantly sells all required items into a purchase list and receives the Dragon payout. |
+| `/arena rock <amount>` | Commit DAEMON to Rock. |
+| `/arena paper <amount>` | Commit DAEMON to Paper. |
+| `/arena scissors <amount>` | Commit DAEMON to Scissors. |
+| `/arena spread <amount>` | Split DAEMON across all choices. |
+| `/arena autospread <amount>` | Auto-split each convergence. |
+| `/arena gamefix` | Restricted dashboard resend. |
+| `/arena cancel` | Restricted void/refund current convergence. |
+| `/arena forcestart` | Restricted open new convergence. |
+| `/rock <amount>` | Quick Rock commit. |
+| `/paper <amount>` | Quick Paper commit. |
+| `/scissors <amount>` | Quick Scissors commit. |
+| `/governance proposal <percentage> <proposal_text>` | Submit proposal. |
+| `/governance vote <proposal_id> <yes|no>` | Vote on proposal. |
+| `/governance bid <amount>` | Bid for next biddable proposal slot. |
+| `/iamsatoshinakamoto <yes|no>` | Claim/toggle top DAEMON holder role. |
 
-### Discord Daemon commands
+---
 
-These commands use the separate DAEMON token.
+## Validation before pushing
 
-| Command | Purpose |
-|---|---|
-| `/daemon balance` | Shows your DAEMON balance privately. |
-| `/daemon send <user> <amount> [hidden] [message]` | Transfers DAEMON to another user. `hidden=true` sends anonymously. |
-| `/daemon stats` | Shows public DAEMON supply, emission, phase, and holder stats. |
-| `/daemon info` | Shows the in-bot DAEMON guide. |
-| `/daemon split <amount>` | Commits DAEMON equally to Rock, Paper, and Scissors. Amount must be divisible by 3. |
-| `/daemon dailysplit <amount>` | Auto-commits DAEMON equally each convergence. Use `0` to cancel. |
-| `/daemon market` | Shows the DAEMON/Dragon order book. |
-| `/daemon sell <amount> <price_per>` | Lists DAEMON for sale at a Dragon price per DAEMON. |
-| `/daemon buy <amount> <price_per>` | Places a DAEMON buy order using Dragons from the linked vault. |
-| `/daemon orders` | Shows your open DAEMON buy and sell orders. |
-| `/daemon cancel_order <order_id>` | Cancels one DAEMON order. |
-| `/daemon dailysplitexpiration <games>` | Admin command to set how many games a daily split lasts. `0` means no expiration. |
+Run at least:
 
-### Discord arena commands
+```bash
+python -m py_compile app.py bot.py
+grep -R "DISCORD_TOKEN\|API_KEY\|[A-Za-z0-9_-]\{50,\}" . --exclude-dir=.git --exclude-dir=__pycache__
+```
 
-These are DAEMON arena commands. The arena dashboard also has Rock/Paper/Scissors buttons that commit `111 DAEMON`.
+For the Java plugin, compile against your Paper API jar before publishing a release jar.
 
-| Command | Purpose |
-|---|---|
-| `/arena rock <amount>` | Commits DAEMON to Rock. |
-| `/arena paper <amount>` | Commits DAEMON to Paper. |
-| `/arena scissors <amount>` | Commits DAEMON to Scissors. |
-| `/arena spread <amount>` | Splits DAEMON equally across Rock, Paper, and Scissors. Amount must be divisible by 3. |
-| `/arena autospread <amount>` | Auto-splits DAEMON each convergence. Use `0` to cancel. |
-| `/arena autospreadadjust <days>` | Admin command to limit how many days autospread may cover. |
-| `/arena gamefix` | Restricted command to resend the active arena dashboard. |
-| `/arena cancel` | Restricted command to void the current convergence and refund commitments. |
-| `/arena forcestart` | Restricted command to immediately open a new convergence. |
-
-### Top-level quick arena commands
-
-| Command | Purpose |
-|---|---|
-| `/rock <amount>` | Shortcut for committing DAEMON to Rock. |
-| `/paper <amount>` | Shortcut for committing DAEMON to Paper. |
-| `/scissors <amount>` | Shortcut for committing DAEMON to Scissors. |
-
-### Discord governance commands
-
-| Command | Purpose |
-|---|---|
-| `/governance proposal <percentage> <proposal_text>` | Submits a governance proposal. `percentage` is the required yes weight of circulating supply, from 1 to 100. |
-| `/governance vote <proposal_id> <yes\|no>` | Votes yes or no on an active proposal. |
-| `/governance bid <amount>` | Bids DAEMON for the next biddable proposal slot. |
-
-### Special / admin / role commands
-
-| Command | Purpose |
-|---|---|
-| `/iamsatoshinakamoto <yes\|no>` | Toggles the Satoshi Nakamoto role claim if you are the current top DAEMON holder. |
-| `/add-dragons <user> <amount>` | Admin command to credit Dragons to a user's Economy++ vault. |
-| `/remove-dragons <user> <amount>` | Admin command to remove Dragons from a user's Economy++ vault. |
-| `!supplycheck` | Hidden admin prefix command that DMs a DAEMON supply report. |
-
-### Prefix economy commands
-
-The bot also supports legacy `!` commands. For normal users:
-
-| Command | Purpose |
-|---|---|
-| `!give <user> <amount>` | Sends Dragons to another linked user. |
-| `!sell <item> <amount> <price_per>` | Places a sell order. |
-| `!buy <item> <amount> <price_per>` | Places a buy order. |
-| `!cancel <order_id>` | Cancels one order. |
-| `!cancel_all [item]` | Cancels all orders, optionally filtered by item. |
-| `!cancel-all [item]` | Same as `!cancel_all`. |
-| `!market sell <item> <amount> <price_per>` | Alternate prefix form for `!sell`. |
-| `!market buy <item> <amount> <price_per>` | Alternate prefix form for `!buy`. |
-| `!market cancel <order_id>` | Alternate prefix form for `!cancel`. |
-| `!market cancel_all [item]` | Alternate prefix form for `!cancel_all`. |
-
-Configured relay bot accounts may also use admin-style prefix forms:
-
-| Command | Purpose |
-|---|---|
-| `!give <sender_id> <recipient_id> <amount>` | Relay bot form of Dragon transfer. |
-| `!sell <user_id> <item> <amount> <price_per>` | Relay bot form of sell order. |
-| `!buy <user_id> <item> <amount> <price_per>` | Relay bot form of buy order. |
-| `!cancel <user_id> <order_id>` | Relay bot form of order cancellation. |
-| `!cancel_all <user_id> [item]` | Relay bot form of cancel-all. |
-
-## Security checklist before pushing
-
-Run these commands before committing:
+Suggested Git workflow:
 
 ```bash
 git status
-python -m compileall bot.py app.py
-grep -R "DISCORD_TOKEN\|API_KEY\|change-me\|[A-Za-z0-9_-]\{50,\}" . --exclude-dir=.git
+git diff -- README.md app.py bot.py MDragonsEconomy.java plugin.yml .env.example .gitignore
+git add README.md app.py bot.py MDragonsEconomy.java plugin.yml .env.example .gitignore
+git commit -m "Secure public config and refresh README"
+git push
 ```
 
-Do not commit:
+---
 
-- `.env`
-- SQLite databases such as `*.db`, `*.sqlite`, `*.sqlite3`
-- Discord tokens
-- API keys
-- real role/channel/admin IDs if your server is private
-- built `.jar` files
-- Python cache folders
+## Notes for operators
 
-If any real token or API key was ever committed or shared, rotate it before publishing the repository.
-
-## Daemon whitepaper
-
-Daemon: A Decentralized Convergence Protocol for Digital Scarcity and Collective Coordination
-Abstract
-Daemon is a capped-supply digital asset engineered to enable direct, trust-minimized value transfers and high-stakes collective coordination within a defined network. It integrates a straightforward peer-to-peer transfer system with a daily convergence arena that leverages combinatorial choice, ranked pool dynamics, and superlinear reward distribution. Through these mechanisms, participants allocate scarce resources toward uncertain outcomes, surface collective preferences via market-style signaling, and earn freshly issued units in proportion to the conviction and scale of their commitments.
-The protocol enforces a strict maximum supply coupled with a diminishing emission schedule, guaranteeing progressive scarcity. Arena commitments are irreversible by design, pools are ranked and resolved using deterministic rules incorporating cyclic dominance, and intra-pool distributions apply a power-1.5 weighting to favor meaningful concentration of stake. These features promote substantive participation while penalizing low-conviction or overly dispersed allocations.
-At its foundation, Daemon functions without external intermediaries for core operations: transfers execute atomically on a lightweight ledger, arena resolutions occur transparently, and emission follows algorithmic rules. Importantly, the protocol’s consensus and coordination mechanisms are not immutable. Should a sufficient majority of the network reach agreement through its governance process, the underlying rules—including the consensus mechanism itself—may be amended or supplanted. This evolutionary capacity allows Daemon to adapt over time, potentially expanding its utility to support a wide array of valuable applications, provided such changes are carefully formulated, rigorously justified, and attentive to the long-term interests of the participating base that secures and sustains the network.
-In this way, Daemon aspires to serve as a flexible yet disciplined framework for coordination, risk-sharing, and value creation in digital environments.
-1. Introduction
-Many digital assets and community-driven economies struggle with persistent challenges: unconstrained issuance that erodes scarcity, over-reliance on centralized gatekeepers, and inadequate tools for expressing genuine conviction or coordinating around shared outcomes. Conventional transfer systems offer liquidity but little opportunity for participants to demonstrate asymmetric belief or to benefit from collective resolution in a non-linear, merit-based manner.
-Daemon was conceived to overcome these shortcomings by establishing a self-contained digital scarcity token supported by auditable accounting and recurring community convergence events. Its core capabilities include:
-Irreversible, direct transfers between participants.
-A daily arena mechanism for committing tokens to discrete alternatives, resolved through aggregate behavior and combinatorial logic.
-Algorithmically governed emission that rewards active, conviction-driven participation while respecting a hard supply ceiling.
-A governance framework that not only adjusts operational parameters but empowers the network to evolve or replace its consensus mechanisms when broad consensus is achieved.
-By design, Daemon balances rigidity in scarcity and commitment rules with flexibility in its evolutionary path. This duality ensures the protocol can remain relevant and useful across changing circumstances, always prioritizing the integrity and sustained participation of its holder and miner-like base—the community members whose commitments and holdings underpin the system’s value and security.
-2. The Problem of Digital Coordination and Scarcity
-Digital environments frequently fail to establish credible, long-term scarcity. Unlimited or poorly governed issuance dilutes incentives, while centralized control introduces single points of failure and incentive misalignment. Effective coordination—whether allocating resources among competing priorities or surfacing collective judgment—demands mechanisms that reward skin-in-the-game, penalize cheap signaling, and resist capture by low-effort or sybil actors.
-Linear reward models exacerbate fragmentation, as participants are incentivized to spread commitments thinly rather than concentrate them where conviction is strongest. Irreversible allocation mechanisms are rare, limiting the informational value of observed behavior. Moreover, rigid consensus rules risk obsolescence; a protocol that cannot evolve intelligently may stagnate even when superior designs emerge that better serve its users.
-A principled solution therefore requires:
-Strict supply discipline enforced through diminishing emission toward a hard cap.
-Irreversible commitments coupled with non-linear (superlinear) reward functions that amplify the voice of substantial, concentrated stakes.
-Transparent, deterministic resolution logic resistant to post-commitment manipulation.
-Governance that is powerful enough to refine or overhaul the consensus mechanism itself, yet sufficiently guarded to demand genuine majority support and thoughtful proposal design.
-Such a system must remain mindful of its foundational participants—the “miner base” in the broader sense of those who actively secure, use, and hold the asset—ensuring that any evolution demonstrably advances collective utility without undermining the incentives that brought the network into existence.
-3. The Daemon Protocol
-Daemon comprises three tightly integrated layers: the token economy and transfer system, the daily convergence arena, and the emission-governance framework.
-3.1 Token and Transfers
-Balances are maintained in a verifiable ledger tied to participant identifiers. Transfers are atomic and final: the sender’s balance decreases while the recipient’s increases, with optional transparent logging. This design mirrors the irreversibility emphasized throughout the protocol and supports seamless integration with external bridged assets via reservation and refund primitives that preserve ledger consistency.
-3.2 The Daily Convergence Arena
-The arena functions as the primary engine of coordination and reward distribution. Each cycle opens with three mutually exclusive options (traditionally denoted Rock, Paper, and Scissors). Participants may commit any integer quantity of Daemon (minimum one unit) to any combination of options. Individual choices remain private at submission time, though aggregate participant totals are visible via a live leaderboard. Commitments are binding and cannot be modified or withdrawn.
-Upon cycle termination:
-Three pools are formed from total commitments per option.
-Pools are ranked by size, with tiebreakers based on the timestamp of each pool’s first commitment (earliest timestamps favored for higher ranks, latest for the underdog position).
-Resolution proceeds as follows:
-The underdog (smallest) pool automatically claims half the daily emission.
-The largest and second-largest pools engage in a cyclic dominance contest; the victor claims the remaining half.
-Commitments in losing pools are forfeited.
-Within each winning pool, the emission tranche is distributed according to a power-1.5 weighting formula: an individual’s share equals their commitment raised to the 1.5 power, divided by the sum of all such weighted commitments in the pool, multiplied by the allocated reward.
-Special handling ensures fairness in low-participation or tied scenarios. The randomized resolution timestamp within each daily window adds strategic depth and discourages last-moment gaming.
-This structure transforms the arena into a dynamic preference-revelation mechanism, where participants’ allocations reflect beliefs about relative strengths, and outcomes richly reward accurate foresight and decisive positioning.
-3.3 Emission Schedule and Scarcity
-Daemon observes a hard cap of 21,000,000 units. Daily emission commences at 7,200 units and is released exclusively through successful arena resolutions (supplemented by modest initial distributions). Upon reaching defined cumulative thresholds and at annual intervals thereafter, the daily rate contracts by a factor of 0.9. This geometrically diminishing schedule drives the circulating supply toward the cap, embedding long-term scarcity into the protocol’s DNA.
-3.4 Optional Market Layer
-A limit-order book against linked external assets provides additional liquidity and price discovery. Orders match atomically when bid-ask conditions are satisfied, maintaining the integrity of both the arena and transfer layers.
-3.5 Governance and Evolutionary Consensus
-Governance is conducted through formalized proposals that specify a required approval threshold expressed as a percentage of circulating supply. Voting employs weighted commitments, supported by cooldowns and priority-bidding mechanisms to elevate signal quality and deter noise.
-A defining feature of Daemon is its recognition that no consensus mechanism is eternal. If a sufficiently strong majority of the network concurs via the governance process, the protocol’s consensus rules—including arena resolution logic, weighting functions, emission mechanics, or the governance system itself—may be modified or entirely replaced. Such changes are expected to occur judiciously. Proposals must be meticulously drafted, clearly articulated, and demonstrably oriented toward enhancing the protocol’s long-term utility. Particular care is given to preserving and strengthening the position of the active participant base—the holders and committed users whose ongoing engagement constitutes the true security and vitality of the network.
-In this manner, Daemon is engineered not as a static artifact but as a living protocol capable of intelligent self-improvement. Evolution remains subordinate to consensus, ensuring that any transformation serves the collective interest rather than narrow or transient agendas.
-4. Incentives and Game-Theoretic Properties
-The combination of irreversible commitments, superlinear (power-1.5) rewards, and the underdog bonus cultivates an environment that values conviction, concentration, and informed risk-taking. Cyclic dominance between leading pools maintains competitive tension, while hidden individual choices and randomized timing mitigate collusion and front-running.
-The governance layer, including its capacity to evolve consensus, introduces a meta-incentive for thoughtful stewardship. Participants are encouraged to propose upgrades only when they can credibly argue that the changes will benefit the broader ecosystem and its foundational users. This design aligns short-term actions with long-term network health.
-5. Security and Implementation Considerations
-Daemon is realized through a robust, lightweight implementation centered on a transactional SQLite ledger, augmented with concurrency controls for critical sections such as arena resolution and order matching. External asset bridges employ careful reservation patterns to avoid double-spending or desynchronization risks.
-While technical safeguards are essential, the protocol ultimately relies on the integrity and engagement of its participant majority. Governance upgrades to the consensus mechanism demand high thresholds and transparent deliberation, reducing the likelihood of hasty or exploitative alterations. Ongoing community review, periodic technical assessments, and gradual rollout of significant changes are strongly encouraged.
-6. Conclusion
-Daemon represents a coherent synthesis of digital scarcity, irreversible economic signaling, and adaptive collective coordination. Its capped supply, diminishing emission, daily convergence arena with power-weighted outcomes, and flexible governance framework together create a powerful instrument for value expression and discovery.
-By embedding the possibility of consensus-driven evolution—including fundamental changes to the consensus mechanism itself—Daemon positions itself as a protocol that can grow in sophistication and applicability while remaining anchored to the interests of its active base. Any future modifications must be well-considered, clearly communicated, and oriented toward producing genuine, sustained utility for the network that mines, holds, and stewards it.
-Ultimately, Daemon transcends the role of a simple token. It constitutes a foundational protocol for coordinated belief and shared upside in digital space—one that invites thoughtful participation today and intelligent adaptation tomorrow.
-
-Appendix: Mathematical Notes
-Power Weighting: For commitments c1,c2,…,cn c_1, c_2, \dots, c_n c1​,c2​,…,cn​ in a winning pool, an individual’s reward share is ci1.5∑jcj1.5×R \frac{c_i^{1.5}}{\sum_j c_j^{1.5}} \times R ∑j​cj1.5​ci1.5​​×R, where R R R denotes the pool’s allocated emission.
-Tiebreaker Rule: Equal-sized pools are ranked according to the timestamp of their first commitment (earliest for higher ranks, latest for underdog).
-Emission Reduction: Daily rate updates follow dt+1=⌊0.9×dt⌋ d_{t+1} = \lfloor 0.9 \times d_t \rfloor dt+1​=⌊0.9×dt​⌋ at predefined thresholds and yearly cycles.
-This whitepaper describes the principles and mechanics of the Daemon protocol in its present form. As a living system, Daemon will continue to develop through the informed will of its participant majority, always with careful regard for the long-term health and incentives of its foundational community.
+- Keep `Daemon Whitepaper.pdf` as the long-form protocol document.
+- Treat this README as the practical setup and operator guide.
+- Do not rename existing API endpoints, slash commands, database tables, or columns without a migration plan.
+- Back up both SQLite databases before deploying behavior changes.
+- Rotate secrets immediately if you suspect they were exposed.

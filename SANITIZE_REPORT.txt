@@ -1,17 +1,33 @@
-Sanitize report
-===============
+# Sanitization Report
 
-Status: OK
+## Summary
 
-Changes made:
-- Removed the hardcoded Java API key fallback from MDragonsEconomy.java.
-- Moved bot.py Discord token, backend URL, role IDs, channel IDs, user IDs, emoji ID, and initial balances to environment variables.
-- Added lightweight .env loading to bot.py and app.py without requiring python-dotenv.
-- Added .env.example with placeholders only.
-- Added .gitignore to block .env, .env.* except .env.example, databases, Python caches, and Java build outputs.
-- app.py and bot.py compile successfully with py_compile.
+This update keeps existing economy behavior intact while removing publish blockers and making public configuration explicit.
 
-Scan results:
-- Original embedded Java API key: not found in sanitized output.
-- Known hardcoded Discord/user/channel IDs from the uploaded bot.py: not found in sanitized bot.py.
-- Long numeric IDs remaining: only placeholder 123456789012345678 in comments/examples.
+## Code changes made
+
+- Removed the hardcoded Java plugin API key fallback.
+- Added a startup warning in the Java plugin when `API_KEY` is missing.
+- Changed the FastAPI backend so it refuses to start without `API_KEY`.
+- Changed backend API-key middleware to protect every `/api/...` route except `/api/health`.
+- Uses constant-time `secrets.compare_digest` for backend API-key comparison.
+- Changed the Discord bot so `BACKEND_URL` is configurable from the environment.
+- Changed the Discord bot so it refuses to start without `DISCORD_TOKEN` and `API_KEY`.
+- Moved Discord role IDs, channel IDs, privileged user IDs, relay bot IDs, DAEMON emoji, and initial DAEMON seed balances to environment variables.
+- Added `.env.example`.
+- Added `.gitignore`.
+- Rewrote `README.md` as a cleaner public/operator guide.
+
+## Validation run
+
+- `py_compile` passed for `app.py`.
+- `py_compile` passed for `bot.py`.
+- Secret-style scan found no hardcoded 50+ character token-like strings in the update folder.
+- Discord-ID scan found no hardcoded 17+ digit IDs in the update folder.
+
+## Notes
+
+- `Daemon Whitepaper.pdf` was not edited.
+- `plugin.yml` was not changed except being included in the package.
+- Java compilation was not run here because the Paper/Spigot API jar was not present in the uploaded files.
+- A raw unified diff was intentionally not included because diffs can repeat removed secrets/IDs from the original source.

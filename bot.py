@@ -18,118 +18,98 @@ from zoneinfo import ZoneInfo
 import logging
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    """Read an integer environment variable.
 
-# ─────────────────────────────────────────────────────────────────
-# ENV LOADING + CONFIG HELPERS
-# ─────────────────────────────────────────────────────────────────
-def _load_env_file(path: str | None = None) -> None:
-    """Load KEY=VALUE pairs from .env without requiring python-dotenv."""
-    env_path = path or os.environ.get("ENV_FILE", ".env")
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
-    except FileNotFoundError:
-        pass
-
-
-_load_env_file()
-
-
-def env_str(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
-
-
-def env_int(name: str, default: int = 0) -> int:
-    raw = env_str(name)
-    if not raw:
+    Defaults to 0 so public copies do not grant permissions or target private
+    channels until the operator explicitly configures IDs.
+    """
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
         return default
     try:
         return int(raw)
-    except ValueError:
-        raise RuntimeError(f"{name} must be an integer")
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
 
 
-def env_float(name: str, default: float = 0.0) -> float:
-    raw = env_str(name)
+def _env_int_set(name: str) -> set[int]:
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        raise RuntimeError(f"{name} must be a number")
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    raw = env_str(name)
-    if not raw:
-        return default
-    return raw.lower() not in {"0", "false", "no", "off"}
-
-
-def env_int_list(name: str) -> list[int]:
-    raw = env_str(name)
-    if not raw:
-        return []
-    values: list[int] = []
+        return set()
+    result: set[int] = set()
     for part in raw.split(","):
-        part = part.strip()
-        if part:
-            values.append(int(part))
-    return values
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            result.add(int(value))
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must contain comma-separated integer IDs") from exc
+    return result
 
 
-def env_json_int_map(name: str, default: dict[int, int] | None = None) -> dict[int, int]:
-    raw = env_str(name)
+def _env_initial_balances() -> dict[int, int]:
+    """Read optional DAEMON seed balances from JSON.
+
+    Example:
+      DAEMON_INITIAL_BALANCES='{"123": 7200}'
+    """
+    raw = os.environ.get("DAEMON_INITIAL_BALANCES", "").strip()
     if not raw:
-        return default or {}
-    data = json.loads(raw)
-    return {int(k): int(v) for k, v in data.items()}
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        balances: dict[int, int] = {}
+        for user_id, amount in data.items():
+            parsed_amount = int(amount)
+            if parsed_amount > 0:
+                balances[int(user_id)] = parsed_amount
+        return balances
+    except Exception as exc:
+        raise RuntimeError("DAEMON_INITIAL_BALANCES must be a JSON object of Discord user IDs to positive integer balances") from exc
+
 
 # ─────────────────────────────────────────────────────────────────
 # CONFIG — Economy bot
 # ─────────────────────────────────────────────────────────────────
-TOKEN    = env_str("DISCORD_TOKEN")
-BASE_URL = env_str("BACKEND_BASE_URL", env_str("BASE_URL", "http://localhost:8000/api")).rstrip("/")
-API_KEY  = env_str("API_KEY")
+TOKEN    = os.environ.get("DISCORD_TOKEN")
+BASE_URL = os.environ.get("BACKEND_URL", "http://mdragons-backend:8000/api").rstrip("/")
+API_KEY = os.environ.get("API_KEY", "").strip()
 API_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 
 # ─── Role IDs ─────────────────────────────────────────────────────
-CASHOUT_ROLE_ID            = env_int("CASHOUT_ROLE_ID")
-MDRAGONS_ROLE_ID           = env_int("MDRAGONS_ROLE_ID")
-TEN_MDRAGONS_ROLE_ID       = env_int("TEN_MDRAGONS_ROLE_ID")
-TEN_CASHOUT_ROLE_ID        = env_int("TEN_CASHOUT_ROLE_ID")
-CHAIRMAN_ROLE_ID           = env_int("CHAIRMAN_ROLE_ID")
-MANSA_MUSA_ROLE_ID         = env_int("MANSA_MUSA_ROLE_ID")
-NETHERITE_OVERLORD_ROLE_ID = env_int("NETHERITE_OVERLORD_ROLE_ID")
-SATOSHI_NAKAMOTO_ROLE_ID   = env_int("SATOSHI_NAKAMOTO_ROLE_ID")
+CASHOUT_ROLE_ID            = _env_int("CASHOUT_ROLE_ID")
+MDRAGONS_ROLE_ID           = _env_int("MDRAGONS_ROLE_ID")
+TEN_MDRAGONS_ROLE_ID       = _env_int("TEN_MDRAGONS_ROLE_ID")
+TEN_CASHOUT_ROLE_ID        = _env_int("TEN_CASHOUT_ROLE_ID")
+CHAIRMAN_ROLE_ID           = _env_int("CHAIRMAN_ROLE_ID")
+MANSA_MUSA_ROLE_ID         = _env_int("MANSA_MUSA_ROLE_ID")
+NETHERITE_OVERLORD_ROLE_ID = _env_int("NETHERITE_OVERLORD_ROLE_ID")
+SATOSHI_NAKAMOTO_ROLE_ID   = _env_int("SATOSHI_NAKAMOTO_ROLE_ID")
 
 # ─── Channel IDs ──────────────────────────────────────────────────
-ANNOUNCEMENT_CHANNEL_ID    = env_int("ANNOUNCEMENT_CHANNEL_ID")
-TRANSACTION_LOG_CHANNEL_ID = env_int("TRANSACTION_LOG_CHANNEL_ID")
-DEPOSIT_LOG_CHANNEL_ID     = env_int("DEPOSIT_LOG_CHANNEL_ID")
-TRADE_LOG_CHANNEL_ID       = env_int("TRADE_LOG_CHANNEL_ID")
-EXTERNAL_ECONOMY_LOG_ID    = env_int("EXTERNAL_ECONOMY_LOG_ID")
-UNBELIEVABOAT_BOT_ID       = env_int("UNBELIEVABOAT_BOT_ID")
-EXTERNAL_ECONOMY_BOT_ID    = env_int("EXTERNAL_ECONOMY_BOT_ID")
-EXTERNAL_ECONOMY_SCANNER   = env_int("EXTERNAL_ECONOMY_SCANNER")
-COMMIT_LOG_CHANNEL_ID      = env_int("COMMIT_LOG_CHANNEL_ID")
+ANNOUNCEMENT_CHANNEL_ID    = _env_int("ANNOUNCEMENT_CHANNEL_ID")
+TRANSACTION_LOG_CHANNEL_ID = _env_int("TRANSACTION_LOG_CHANNEL_ID")
+DEPOSIT_LOG_CHANNEL_ID     = _env_int("DEPOSIT_LOG_CHANNEL_ID")
+TRADE_LOG_CHANNEL_ID       = _env_int("TRADE_LOG_CHANNEL_ID")
+EXTERNAL_ECONOMY_LOG_ID    = _env_int("EXTERNAL_ECONOMY_LOG_ID")
+UNBELIEVABOAT_BOT_ID       = _env_int("UNBELIEVABOAT_BOT_ID")
+EXTERNAL_ECONOMY_BOT_ID    = _env_int("EXTERNAL_ECONOMY_BOT_ID")
+EXTERNAL_ECONOMY_SCANNER   = _env_int("EXTERNAL_ECONOMY_SCANNER")
+COMMIT_LOG_CHANNEL_ID      = _env_int("COMMIT_LOG_CHANNEL_ID")
 
 # ─── Special permissions ──────────────────────────────────────────
-PAUSE_INJECTION_USER_ID = env_int("PAUSE_INJECTION_USER_ID")
+PAUSE_INJECTION_USER_ID = _env_int("PAUSE_INJECTION_USER_ID")
 
 # ─── Thresholds & rewards ─────────────────────────────────────────
-CASHOUT_THRESHOLD_1 = env_int("CASHOUT_THRESHOLD_1", 35_000)
-CASHOUT_THRESHOLD_2 = env_int("CASHOUT_THRESHOLD_2", 350_000)
-MDRAGONS_REWARD     = env_int("MDRAGONS_REWARD", 35_000)
-TEN_MDRAGONS_REWARD = env_int("TEN_MDRAGONS_REWARD", 350_000)
-CASHOUT_COOLDOWN    = env_int("CASHOUT_COOLDOWN", 60)  # seconds
+CASHOUT_THRESHOLD_1 = 35_000
+CASHOUT_THRESHOLD_2 = 350_000
+MDRAGONS_REWARD     = 35_000
+TEN_MDRAGONS_REWARD = 350_000
+CASHOUT_COOLDOWN    = 60  # seconds
 
 # ─── Colour palette ───────────────────────────────────────────────
 BLUE  = 0x1E90FF
@@ -142,28 +122,31 @@ _cashout_cooldowns: dict[int, float] = {}
 # ─────────────────────────────────────────────────────────────────
 # CONFIG — Daemon bot
 # ─────────────────────────────────────────────────────────────────
-DAEMON_EMOJI        = env_str("DAEMON_EMOJI", "🐉")
-TRANSACTION_CHANNEL = env_int("TRANSACTION_CHANNEL_ID")
-ARENA_CHANNEL       = env_int("ARENA_CHANNEL_ID")
-ADMIN_USER_ID       = env_int("ADMIN_USER_ID")
-GAMEFIX_USER_ID     = env_int("GAMEFIX_USER_ID")
+DAEMON_EMOJI        = os.environ.get("DAEMON_EMOJI", "DAEMON")
+TRANSACTION_CHANNEL = _env_int("DAEMON_TRANSACTION_CHANNEL_ID")
+ARENA_CHANNEL       = _env_int("ARENA_CHANNEL_ID")
+ADMIN_USER_ID       = _env_int("ADMIN_USER_ID")
+GAMEFIX_USER_ID     = _env_int("GAMEFIX_USER_ID")
 
-MAX_SUPPLY         = env_int("MAX_SUPPLY", 21_000_000)
-INITIAL_DAILY      = env_int("INITIAL_DAILY", 7_200)
-HALVING_THRESHOLD  = env_int("HALVING_THRESHOLD", 2_100_000)
-HALVING_MULTIPLIER = env_float("HALVING_MULTIPLIER", 0.9)
+MAX_SUPPLY         = 21_000_000
+INITIAL_DAILY      = 7_200
+HALVING_THRESHOLD  = 2_100_000
+HALVING_MULTIPLIER = 0.9
 
-PROPOSAL_BASE_HOURS = env_int("PROPOSAL_BASE_HOURS", 7 * 24)
-PROPOSAL_COOLDOWN   = env_int("PROPOSAL_COOLDOWN", 17 * 24 * 3600)
-PROPOSAL_BID_EVERY  = env_int("PROPOSAL_BID_EVERY", 2)
-SYNC_COMMANDS_TO_GUILDS = env_bool("SYNC_COMMANDS_TO_GUILDS", True)
-COMMAND_SYNC_GUILD_IDS = env_int_list("COMMAND_SYNC_GUILD_IDS")
-PREFIX_COMMAND_BOT_IDS = set(env_int_list("PREFIX_COMMAND_BOT_IDS"))
+PROPOSAL_BASE_HOURS = 7 * 24
+PROPOSAL_COOLDOWN   = 17 * 24 * 3600
+PROPOSAL_BID_EVERY  = 2
+SYNC_COMMANDS_TO_GUILDS = os.environ.get("SYNC_COMMANDS_TO_GUILDS", "1").strip().lower() not in {"0", "false", "no"}
+COMMAND_SYNC_GUILD_IDS = [
+    int(gid.strip())
+    for gid in os.environ.get("COMMAND_SYNC_GUILD_IDS", "").split(",")
+    if gid.strip().isdigit()
+]
+PREFIX_COMMAND_BOT_IDS = _env_int_set("PREFIX_COMMAND_BOT_IDS")
 
-CEST = ZoneInfo(env_str("TIMEZONE", "Europe/Berlin"))
+CEST = ZoneInfo("Europe/Berlin")
 
-# JSON object, e.g. {"123456789012345678": 1000}
-INITIAL_BALANCES = env_json_int_map("INITIAL_BALANCES_JSON", {})
+INITIAL_BALANCES = _env_initial_balances()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -778,6 +761,8 @@ async def log_daemon_trades(guild: Optional[discord.Guild], trades: list[dict]):
 
 
 async def maybe_send_daemon_holder_log():
+    if not ADMIN_USER_ID:
+        return
     now = datetime.now(CEST)
     today = now.strftime("%Y-%m-%d")
     if get_daemon_market_meta("holder_log_last_sent") == today:
@@ -789,7 +774,10 @@ async def maybe_send_daemon_holder_log():
             "SELECT user_id, balance FROM balances WHERE balance>0 ORDER BY balance DESC LIMIT 100"
         ).fetchall()
 
-    user = await bot.fetch_user(ADMIN_USER_ID)
+    try:
+        user = await bot.fetch_user(ADMIN_USER_ID)
+    except Exception:
+        return
     if not user:
         return
 
@@ -1901,43 +1889,67 @@ async def get_mc_uuid(discord_id: str) -> Optional[str]:
     return None
 
 
-async def update_netherite_overlord(guild: Optional[discord.Guild]):
+async def update_holder_role(
+    guild: Optional[discord.Guild],
+    endpoint: str,
+    role_id: int,
+    role_name: str,
+):
     if not guild:
         return
     try:
         session = await get_http_session()
-        async with session.get(f"{BASE_URL}/top_netherite") as r:
+        async with session.get(f"{BASE_URL}/{endpoint}") as r:
             if r.status != 200:
                 return
             top = await r.json()
         top_uuid = top.get("mc_uuid")
-        if not top_uuid:
-            return
-        async with session.get(f"{BASE_URL}/discord_id/{top_uuid}") as r:
-            if r.status != 200:
-                return
-            top_discord_id = str((await r.json()).get("discord_id"))
-
-        role = guild.get_role(NETHERITE_OVERLORD_ROLE_ID)
+        role = guild.get_role(role_id)
         if not role:
             return
+
+        if not top_uuid:
+            for member in list(role.members):
+                try:
+                    await member.remove_roles(role, reason=f"{role_name} has no eligible holder")
+                except discord.Forbidden:
+                    pass
+            return
+
+        async with session.get(f"{BASE_URL}/discord_id/{top_uuid}") as r:
+            if r.status != 200:
+                for member in list(role.members):
+                    try:
+                        await member.remove_roles(role, reason=f"{role_name} holder is not linked to Discord")
+                    except discord.Forbidden:
+                        pass
+                return
+            top_discord_id = str((await r.json()).get("discord_id"))
 
         for member in list(role.members):
             if str(member.id) != top_discord_id:
                 try:
-                    await member.remove_roles(role, reason="Netherite Overlord dethroned")
+                    await member.remove_roles(role, reason=f"{role_name} dethroned")
                 except discord.Forbidden:
                     pass
 
         try:
-            overlord = await guild.fetch_member(int(top_discord_id))
+            holder = await guild.fetch_member(int(top_discord_id))
         except (discord.NotFound, discord.HTTPException):
             return
-        if role not in overlord.roles:
-            await overlord.add_roles(role, reason="New Netherite Overlord")
+        if role not in holder.roles:
+            await holder.add_roles(role, reason=f"New {role_name}")
 
     except Exception:
-        log.exception("[netherite overlord] update failed")
+        log.exception("[%s] update failed", role_name.lower())
+
+
+async def update_netherite_overlord(guild: Optional[discord.Guild]):
+    await update_holder_role(guild, "top_netherite", NETHERITE_OVERLORD_ROLE_ID, "Netherite Overlord")
+
+
+async def update_mansa_musa(guild: Optional[discord.Guild]):
+    await update_holder_role(guild, "top_dragons", MANSA_MUSA_ROLE_ID, "Mansa Musa")
 
 
 def item_display(item_key: str) -> str:
@@ -1956,14 +1968,58 @@ def ok_embed(msg: str) -> discord.Embed:
 
 
 async def log_transaction(guild: Optional[discord.Guild], title: str, description: str, color: int = BLUE):
-    if not guild: return
+    if not guild:
+        return
     ch = guild.get_channel(TRANSACTION_LOG_CHANNEL_ID)
-    if not ch: return
+    if not ch:
+        return
     embed = discord.Embed(title=title, description=description, color=color)
     try:
         await ch.send(embed=embed)
     except discord.Forbidden:
         pass
+
+
+def format_decimal(value, decimals: int = 2) -> str:
+    number = float(value or 0)
+    return f"{int(number):,}" if number.is_integer() else f"{number:,.{decimals}f}"
+
+
+def normalize_audit_reason(reason: Optional[str]) -> str:
+    return (reason or "").strip()[:500] or "No reason provided"
+
+
+def is_economy_admin(user_id: int) -> bool:
+    return user_id == PAUSE_INJECTION_USER_ID
+
+
+def loop_state(loop: tasks.Loop) -> str:
+    return "running" if loop.is_running() else "stopped"
+
+
+def create_daemon_backup() -> Optional[dict]:
+    src = os.path.abspath(DB_PATH)
+    if not os.path.exists(src):
+        return None
+    backup_dir = os.path.join(os.path.dirname(src), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = os.path.join(backup_dir, f"daemon-{stamp}.db")
+
+    source = sqlite3.connect(src, timeout=30)
+    target = sqlite3.connect(dest)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    return {"path": dest, "bytes": os.path.getsize(dest)}
+
+
+def format_backup_result(label: str, backup: Optional[dict], missing_path: str) -> str:
+    if not backup:
+        return f"{label} backup skipped: `{missing_path}` was not found"
+    return f"{label} backup: `{backup['path']}` ({int(backup['bytes']):,} bytes)"
 
 
 async def resolve_mc_mention(session: aiohttp.ClientSession, mc_uuid: str) -> str:
@@ -1986,6 +2042,35 @@ def parse_discord_id(raw: str) -> Optional[int]:
         return int(m.group(1))
     if token.isdigit():
         return int(token)
+    return None
+
+
+def parse_external_give_amount(text: str) -> Optional[int]:
+    patterns = (
+        r"Cash:\s*`?\+?\s*([0-9][0-9,._\s]*)`?",
+        r"\+\s*([0-9][0-9,._\s]*)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        digits = re.sub(r"\D", "", match.group(1))
+        if digits:
+            return int(digits)
+    return None
+
+
+def resolve_exchange_response_channel(
+    guild: discord.Guild,
+    source_message: discord.Message,
+    text: str,
+) -> Optional[discord.abc.Messageable]:
+    for raw_id in re.findall(r"<#(\d+)>", text):
+        channel = guild.get_channel(int(raw_id))
+        if channel and hasattr(channel, "send"):
+            return channel
+    if hasattr(source_message.channel, "send"):
+        return source_message.channel
     return None
 
 
@@ -2083,10 +2168,45 @@ async def adjust_dragons_for_discord_user(discord_id: int, delta: int) -> tuple[
         if r.status != 200:
             return False, (await r.json()).get("detail", "Failed to adjust dragons.")
         data = await r.json()
+    old_balance = int(float(data.get("old_balance", 0)))
     new_balance = int(float(data.get("new_balance", 0)))
     verb = "added" if delta >= 0 else "removed"
     prep = "to" if delta >= 0 else "from"
-    return True, f"{verb.title()} **🐉 {abs(delta):,}** {prep} <@{discord_id}>. New vault balance: **🐉 {new_balance:,}**."
+    return True, (
+        f"{verb.title()} **{abs(delta):,} dragons** {prep} <@{discord_id}>. "
+        f"Balance: **{old_balance:,} -> {new_balance:,} dragons**."
+    )
+
+
+async def handle_admin_dragon_adjustment(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    amount: int,
+    direction: int,
+    reason: Optional[str],
+    color: int,
+):
+    await interaction.response.defer(ephemeral=True)
+    if not is_economy_admin(interaction.user.id):
+        await interaction.followup.send(embed=err_embed("You cannot use this command."), ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.followup.send(embed=err_embed("Amount must be positive."), ephemeral=True)
+        return
+
+    ok, msg = await adjust_dragons_for_discord_user(user.id, amount * direction)
+    await interaction.followup.send(embed=ok_embed(msg) if ok else err_embed(msg), ephemeral=True)
+    if not ok:
+        return
+
+    reason_text = normalize_audit_reason(reason)
+    await log_transaction(
+        interaction.guild,
+        "Admin Dragon Adjustment",
+        f"Admin: <@{interaction.user.id}>\nTarget: <@{user.id}>\nReason: {reason_text}\n{msg}",
+        color=color,
+    )
+    await update_mansa_musa(interaction.guild)
 
 
 async def handle_prefix_economy_message(message: discord.Message) -> bool:
@@ -2136,6 +2256,7 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
             await message.reply(embed=ok_embed(msg) if ok else err_embed(msg), mention_author=False)
             if ok:
                 await log_transaction(message.guild, "🐉 Economy++ Give", msg, color=GREEN)
+                await update_mansa_musa(message.guild)
             return True
 
         if cmd in {"!sell", "!buy"}:
@@ -2167,6 +2288,7 @@ async def handle_prefix_economy_message(message: discord.Message) -> bool:
                     mention_author=False,
                 )
                 await update_netherite_overlord(message.guild)
+                await update_mansa_musa(message.guild)
             else:
                 await message.reply(embed=err_embed(msg), mention_author=False)
             return True
@@ -2416,12 +2538,84 @@ async def trade_event_log_loop():
                 await ch.send(embed=embed)
             except discord.Forbidden:
                 pass
+        await update_mansa_musa(guild)
+        await update_netherite_overlord(guild)
     except Exception:
         log.exception("[trade_event_log_loop] failed")
 
 
 @trade_event_log_loop.before_loop
 async def before_trade_event_log_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=15)
+async def bounty_event_log_loop():
+    try:
+        guild = discord.utils.get(bot.guilds)
+        if not guild:
+            return
+        ch = guild.get_channel(TRANSACTION_LOG_CHANNEL_ID)
+        if not ch:
+            return
+        session = await get_http_session()
+        async with session.get(f"{BASE_URL}/log/bounty_events/pending") as r:
+            if r.status != 200:
+                return
+            data = await r.json()
+        entries = data.get("entries", [])
+        if not entries:
+            return
+
+        for e in entries:
+            event_type = str(e.get("event_type") or "")
+            amount_txt = format_decimal(e.get("amount"), decimals=2)
+            target_name = str(e.get("target_name") or e.get("target_uuid") or "unknown")
+            target_label = f"**{target_name}**"
+            target_uuid = str(e.get("target_uuid") or "")
+            if target_uuid:
+                target_label += f" (`{target_uuid[:8]}...`)"
+
+            if event_type == "claimed":
+                killer = await resolve_mc_mention(session, str(e.get("killer_uuid") or ""))
+                title = "Bounty Claimed"
+                description = f"{killer} claimed **{amount_txt} dragons** for killing {target_label}."
+                color = GREEN
+            else:
+                issuer = await resolve_mc_mention(session, str(e.get("issuer_uuid") or ""))
+                title = "Bounty Placed"
+                description = f"{issuer} placed **{amount_txt} dragons** on {target_label}."
+                color = 0xFFB300
+
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=color,
+                timestamp=datetime.fromisoformat(e["timestamp"]) if e.get("timestamp") else None,
+            )
+            try:
+                await ch.send(embed=embed)
+            except discord.Forbidden:
+                pass
+        await update_mansa_musa(guild)
+    except Exception:
+        log.exception("[bounty_event_log_loop] failed")
+
+
+@bounty_event_log_loop.before_loop
+async def before_bounty_event_log_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=5)
+async def holder_role_loop():
+    for guild in bot.guilds:
+        await update_mansa_musa(guild)
+        await update_netherite_overlord(guild)
+
+
+@holder_role_loop.before_loop
+async def before_holder_role_loop():
     await bot.wait_until_ready()
 
 
@@ -2453,12 +2647,9 @@ async def external_give_loop():
                     continue
                 if "give-money" not in text.lower() and "give_money" not in text.lower():
                     continue
-                amount_match = re.search(r'Cash:\s*`\+(\d+)`', text)
-                if not amount_match:
-                    amount_match = re.search(r'\+(\d+)', text)
-                if not amount_match:
+                amount = parse_external_give_amount(text)
+                if amount is None:
                     continue
-                amount = int(amount_match.group(1))
                 if amount <= 0:
                     continue
 
@@ -2492,11 +2683,13 @@ async def external_give_loop():
                 if credit_data.get("duplicate"):
                     continue
 
+                public_channel = resolve_exchange_response_channel(guild, msg, text)
                 try:
-                    await ch.send(
-                        f"<@{sender_id}> exchanged **🐉 {amount:,}** from Economy:dragon: "
-                        f"into Economy++:dragon:."
-                    )
+                    if public_channel:
+                        await public_channel.send(
+                            f"<@{sender_id}> exchanged **🐉 {amount:,}** from Economy:dragon: "
+                            f"into Economy++:dragon:."
+                        )
                 except discord.Forbidden:
                     pass
 
@@ -2514,6 +2707,7 @@ async def external_give_loop():
                         await ch_log.send(embed=log_embed)
                     except discord.Forbidden:
                         pass
+                await update_mansa_musa(guild)
                 log.info("[external_give] +%s 🐉 credited to %s (Discord: %s)", amount, mc_uuid, sender_id)
 
     except Exception:
@@ -2543,12 +2737,19 @@ async def on_ready():
         order_event_log_loop.start()
     if not trade_event_log_loop.is_running():
         trade_event_log_loop.start()
+    if not bounty_event_log_loop.is_running():
+        bounty_event_log_loop.start()
+    if not holder_role_loop.is_running():
+        holder_role_loop.start()
     if not external_give_loop.is_running():
         external_give_loop.start()
     if not arena_cycle.is_running():
         arena_cycle.start()
 
     await _ensure_live_dashboard()
+    for guild in bot.guilds:
+        await update_mansa_musa(guild)
+        await update_netherite_overlord(guild)
     asyncio.create_task(_run_mechanics_tick())
 
 
@@ -2648,14 +2849,17 @@ async def economy_balance(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@economy.command(name="leaderboard", description="Show a non-dragon item leaderboard")
-@app_commands.describe(item="Item key, e.g. netherite, diamond, iron, dirt, wool", page="Page number, 10 entries per page")
+@economy.command(name="leaderboard", description="Show an item or dragon leaderboard")
+@app_commands.describe(item="Item key, e.g. dragons, netherite, diamond, iron, dirt, wool", page="Page number, 10 entries per page")
 async def economy_leaderboard_cmd(interaction: discord.Interaction, item: str, page: int = 1):
     await interaction.response.defer()
     page = max(1, page)
     offset = (page - 1) * 10
     session = await get_http_session()
-    async with session.get(f"{BASE_URL}/leaderboard/{item}?limit=10&offset={offset}") as r:
+    item_key = item.lower().replace("-", "_").replace(" ", "_")
+    is_dragons = item_key in {"dragon", "dragons", "mdragons", "total", "total_dragons", "dragon_total"}
+    endpoint = "leaderboard_dragons" if is_dragons else f"leaderboard/{item}"
+    async with session.get(f"{BASE_URL}/{endpoint}?limit=10&offset={offset}") as r:
         if r.status != 200:
             detail = (await r.json()).get("detail", "Error fetching leaderboard.")
             await interaction.followup.send(embed=err_embed(detail))
@@ -2663,7 +2867,7 @@ async def economy_leaderboard_cmd(interaction: discord.Interaction, item: str, p
         data = await r.json()
 
     entries = data.get("entries", [])
-    item_label = item_display(data.get("item", item))
+    item_label = "Total Dragons" if is_dragons else item_display(data.get("item", item))
     if not entries:
         await interaction.followup.send(embed=discord.Embed(description=f"No holders found for **{item_label}**.", color=BLUE))
         return
@@ -2671,9 +2875,13 @@ async def economy_leaderboard_cmd(interaction: discord.Interaction, item: str, p
     rows = []
     for e in entries:
         holder = await resolve_mc_mention(session, e["mc_uuid"])
-        total = float(e["total"])
-        total_txt = f"{int(total):,}" if total.is_integer() else f"{total:,.4f}"
-        rows.append(f"**#{e['rank']}**  {holder}  -  **{total_txt}**")
+        total_txt = format_decimal(e["total"], decimals=4)
+        if is_dragons:
+            locked = float(e.get("locked") or 0)
+            locked_txt = f" (locked: 🐉 {int(locked):,})" if locked > 0 else ""
+            rows.append(f"**#{e['rank']}**  {holder}  -  **🐉 {total_txt}**{locked_txt}")
+        else:
+            rows.append(f"**#{e['rank']}**  {holder}  -  **{total_txt}**")
 
     embed = discord.Embed(
         title=f"{item_label} Leaderboard",
@@ -2682,6 +2890,143 @@ async def economy_leaderboard_cmd(interaction: discord.Interaction, item: str, p
     )
     embed.set_footer(text=f"Page {page}")
     await interaction.followup.send(embed=embed)
+
+
+@economy.command(name="bounties", description="Show active dragon bounties")
+@app_commands.describe(page="Page number, 10 entries per page")
+async def economy_bounties_cmd(interaction: discord.Interaction, page: int = 1):
+    await interaction.response.defer()
+    page = max(1, page)
+    offset = (page - 1) * 10
+    session = await get_http_session()
+    async with session.get(f"{BASE_URL}/bounties?limit=10&offset={offset}") as r:
+        if r.status != 200:
+            detail = (await r.json()).get("detail", "Error fetching bounties.")
+            await interaction.followup.send(embed=err_embed(detail))
+            return
+        data = await r.json()
+
+    entries = data.get("entries", [])
+    if not entries:
+        await interaction.followup.send(embed=discord.Embed(description="No active bounties.", color=BLUE))
+        return
+
+    rows = []
+    for e in entries:
+        target_uuid = str(e.get("target_uuid") or "")
+        target_name = str(e.get("target_name") or target_uuid[:8] or "unknown")
+        target = f"**{target_name}**"
+        if target_uuid:
+            mention = await resolve_mc_mention(session, target_uuid)
+            target = f"{mention} ({target})" if not mention.startswith("`") else f"{target} ({mention})"
+        amount_txt = format_decimal(e.get("amount"), decimals=2)
+        rows.append(f"**#{e['rank']}**  {target}  -  **{amount_txt} dragons**")
+
+    embed = discord.Embed(
+        title="Active Bounties",
+        description="\n".join(rows),
+        color=0xFFB300,
+    )
+    embed.set_footer(text=f"Page {page}")
+    await interaction.followup.send(embed=embed)
+
+
+@economy.command(name="health", description="[Admin] Check Economy++ backend and bot task health")
+async def economy_health_cmd(interaction: discord.Interaction):
+    if not is_economy_admin(interaction.user.id):
+        await interaction.response.send_message(embed=err_embed("You cannot use this command."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    backend_line = "Backend: unavailable"
+    session = await get_http_session()
+    started = time.monotonic()
+    try:
+        async with session.get(f"{BASE_URL}/health") as r:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            if r.status == 200:
+                data = await r.json()
+                backend_line = (
+                    f"Backend: {data.get('status', 'unknown')} ({latency_ms} ms)\n"
+                    f"MDragons DB: `{data.get('db_path', 'unknown')}`\n"
+                    f"Balance rows: `{data.get('balances', 'unknown')}`"
+                )
+            else:
+                backend_line = f"Backend: HTTP {r.status} ({latency_ms} ms)"
+    except Exception as exc:
+        backend_line = f"Backend: error `{type(exc).__name__}`"
+
+    task_rows = [
+        ("command sync", "done" if _commands_synced else "pending"),
+        ("mechanics", loop_state(mechanics_loop)),
+        ("deposits", loop_state(deposit_log_loop)),
+        ("orders", loop_state(order_event_log_loop)),
+        ("trades", loop_state(trade_event_log_loop)),
+        ("bounties", loop_state(bounty_event_log_loop)),
+        ("external give", loop_state(external_give_loop)),
+        ("holder roles", loop_state(holder_role_loop)),
+        ("arena", loop_state(arena_cycle)),
+    ]
+    daemon_path = os.path.abspath(DB_PATH)
+    daemon_exists = os.path.exists(daemon_path)
+    daemon_size = os.path.getsize(daemon_path) if daemon_exists else 0
+
+    embed = discord.Embed(title="Economy++ Health", color=BLUE)
+    embed.add_field(name="Backend", value=backend_line, inline=False)
+    embed.add_field(
+        name="Bot",
+        value=(
+            f"Daemon DB: `{'present' if daemon_exists else 'missing'}`\n"
+            f"Daemon DB path: `{daemon_path}`\n"
+            f"Daemon DB bytes: `{daemon_size}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Loops", value="\n".join(f"`{name}`: {state}" for name, state in task_rows), inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@economy.command(name="backup", description="[Admin] Create backend and DAEMON database backups")
+@app_commands.describe(reason="Optional audit reason for the backup")
+async def economy_backup_cmd(interaction: discord.Interaction, reason: Optional[str] = None):
+    if not is_economy_admin(interaction.user.id):
+        await interaction.response.send_message(embed=err_embed("You cannot use this command."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    reason_text = normalize_audit_reason(reason)
+    session = await get_http_session()
+    backend_line = "Backend backup: not attempted"
+    try:
+        async with session.post(
+            f"{BASE_URL}/admin/backup",
+            json={"requested_by": str(interaction.user.id), "reason": reason_text},
+        ) as r:
+            if r.status == 200:
+                backend = await r.json()
+                backend_line = f"Backend backup: `{backend.get('path')}` ({int(backend.get('bytes') or 0):,} bytes)"
+            else:
+                detail = (await r.json()).get("detail", f"HTTP {r.status}")
+                backend_line = f"Backend backup failed: {detail}"
+    except Exception as exc:
+        backend_line = f"Backend backup failed: {type(exc).__name__}"
+
+    daemon_path = os.path.abspath(DB_PATH)
+    daemon_backup = await asyncio.to_thread(create_daemon_backup)
+    daemon_line = format_backup_result("DAEMON", daemon_backup, daemon_path)
+
+    embed = discord.Embed(
+        title="Backup Complete",
+        description=f"{backend_line}\n{daemon_line}\nReason: {reason_text}",
+        color=BLUE,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await log_transaction(
+        interaction.guild,
+        "Admin Backup",
+        f"Admin: <@{interaction.user.id}>\nReason: {reason_text}\n{backend_line}\n{daemon_line}",
+        color=BLUE,
+    )
 
 
 @economy.command(name="give", description="Send 🐉 from your Economy++ vault to another user")
@@ -2729,36 +3074,19 @@ async def economy_give_cmd(interaction: discord.Interaction, user: discord.Membe
     )
 
 
+    await update_mansa_musa(interaction.guild)
+
+
 @bot.tree.command(name="add-dragons", description="[Admin] Add dragons to a user's Economy++ vault")
-@app_commands.describe(user="User to credit", amount="Amount of dragons to add")
-async def add_dragons_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.user.id != PAUSE_INJECTION_USER_ID:
-        await interaction.followup.send(embed=err_embed("You cannot use this command."), ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.followup.send(embed=err_embed("Amount must be positive."), ephemeral=True)
-        return
-    ok, msg = await adjust_dragons_for_discord_user(user.id, amount)
-    await interaction.followup.send(embed=ok_embed(msg) if ok else err_embed(msg), ephemeral=True)
-    if ok:
-        await log_transaction(interaction.guild, "Admin Dragon Adjustment", msg, color=GREEN)
+@app_commands.describe(user="User to credit", amount="Amount of dragons to add", reason="Optional audit reason")
+async def add_dragons_cmd(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
+    await handle_admin_dragon_adjustment(interaction, user, amount, 1, reason, GREEN)
 
 
 @bot.tree.command(name="remove-dragons", description="[Admin] Remove dragons from a user's Economy++ vault")
-@app_commands.describe(user="User to debit", amount="Amount of dragons to remove")
-async def remove_dragons_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.user.id != PAUSE_INJECTION_USER_ID:
-        await interaction.followup.send(embed=err_embed("You cannot use this command."), ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.followup.send(embed=err_embed("Amount must be positive."), ephemeral=True)
-        return
-    ok, msg = await adjust_dragons_for_discord_user(user.id, -amount)
-    await interaction.followup.send(embed=ok_embed(msg) if ok else err_embed(msg), ephemeral=True)
-    if ok:
-        await log_transaction(interaction.guild, "Admin Dragon Adjustment", msg, color=RED)
+@app_commands.describe(user="User to debit", amount="Amount of dragons to remove", reason="Optional audit reason")
+async def remove_dragons_cmd(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
+    await handle_admin_dragon_adjustment(interaction, user, amount, -1, reason, RED)
 
 
 @economy.command(name="inventory", description="Check how much of any item you own (vault + in market)")
@@ -3019,6 +3347,7 @@ async def place_sell_order(interaction: discord.Interaction, item_type: str, amo
                     f"{amount}× {item_display(item_type)} @ **🐉 {price_per:.2f}** each"
                 ))
                 await update_netherite_overlord(interaction.guild)
+                await update_mansa_musa(interaction.guild)
             else:
                 await interaction.followup.send(embed=err_embed((await r.json()).get("detail", "Failed to place order.")))
 
@@ -3047,6 +3376,7 @@ async def place_buy_order(interaction: discord.Interaction, item_type: str, amou
                     f"{amount}× {item_display(item_type)} @ up to **🐉 {price_per:.2f}** each"
                 ))
                 await update_netherite_overlord(interaction.guild)
+                await update_mansa_musa(interaction.guild)
             else:
                 await interaction.followup.send(embed=err_embed((await r.json()).get("detail", "Failed to place order.")))
 
@@ -3533,6 +3863,7 @@ async def fill_purchase_list(interaction: discord.Interaction, list_id: int):
     )
     await interaction.followup.send(embed=embed)
     await update_netherite_overlord(interaction.guild)
+    await update_mansa_musa(interaction.guild)
     await log_transaction(interaction.guild, "🛒 Purchase List Filled",
         f"<@{interaction.user.id}> filled **{data['list_name']}** and received **🐉 {int(data['price_paid']):,}**",
         color=GREEN)
@@ -4306,4 +4637,6 @@ if __name__ == "__main__":
     token = TOKEN
     if not token:
         raise RuntimeError("DISCORD_TOKEN is not set")
+    if not API_KEY:
+        raise RuntimeError("API_KEY is not set")
     bot.run(token)

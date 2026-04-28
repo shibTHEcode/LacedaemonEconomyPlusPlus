@@ -24,14 +24,14 @@ import java.util.*;
 
 public class MDragonsEconomy extends JavaPlugin implements Listener {
 
-    private static final String BACKEND_URL = System.getenv().getOrDefault("BACKEND_URL", "http://localhost:8000/api");
+    private static final String BACKEND_URL = System.getenv().getOrDefault("BACKEND_URL", "http://mdragons-backend:8000/api");
     private static final String API_KEY = System.getenv().getOrDefault("API_KEY", "").trim();
     private static final long AFK_TIMEOUT_MS = 5L * 60L * 1000L;
 
     // ─── Commodity registry ───────────────────────────────────────────────────
     // Maps every accepted Material → (commodityKey, baseUnitsPerItem)
     // baseUnitsPerItem: how many base units 1 of this item represents.
-    //   e.g. IRON_INGOT = 1 and IRON_BLOCK = 9 (vault stores iron as ingots)
+    //   e.g. IRON_BLOCK = 1 and IRON_INGOT = 1/9 (vault stores iron as blocks)
     //        DIAMOND_BLOCK = 9 (1 block = 9 diamonds)
     record CEntry(String commodity, double ratio) {}
 
@@ -46,21 +46,21 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
 
     static {
         // ── Ores ─────────────────────────────────────────────────────────────
-        // Coal (base = item = 1; block deposits as 9)
-        reg(Material.COAL_BLOCK, "coal", 9.0);
-        reg(Material.COAL,       "coal", 1.0);
-        DEF_OUT.put("coal", Material.COAL);
+        // Coal (base = block = 1; item deposits as 1/9)
+        reg(Material.COAL_BLOCK, "coal", 1.0);
+        reg(Material.COAL,       "coal", 1.0 / 9);
+        DEF_OUT.put("coal", Material.COAL_BLOCK);
 
-        // Iron (base = ingot = 1; block deposits as 9)
-        reg(Material.IRON_BLOCK, "iron", 9.0);
-        reg(Material.IRON_INGOT, "iron", 1.0);
-        DEF_OUT.put("iron", Material.IRON_INGOT);
+        // Iron (base = block = 1; ingot deposits as 1/9)
+        reg(Material.IRON_BLOCK, "iron", 1.0);
+        reg(Material.IRON_INGOT, "iron", 1.0 / 9);
+        DEF_OUT.put("iron", Material.IRON_BLOCK);
 
-        // Gold (base = ingot = 1; block deposits as 9, nuggets as 1/9)
-        reg(Material.GOLD_BLOCK,  "gold", 9.0);
-        reg(Material.GOLD_INGOT,  "gold", 1.0);
-        reg(Material.GOLD_NUGGET, "gold", 1.0 / 9);
-        DEF_OUT.put("gold", Material.GOLD_INGOT);
+        // Gold (base = block = 1; ingots/nuggets deposit as fractions)
+        reg(Material.GOLD_BLOCK,  "gold", 1.0);
+        reg(Material.GOLD_INGOT,  "gold", 1.0 / 9);
+        reg(Material.GOLD_NUGGET, "gold", 1.0 / 81);
+        DEF_OUT.put("gold", Material.GOLD_BLOCK);
 
         // Copper (base = ingot = 1; block deposits as 9)
         reg(Material.COPPER_BLOCK, "copper", 9.0);
@@ -72,10 +72,10 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         reg(Material.DIAMOND_BLOCK, "diamond", 9.0);
         DEF_OUT.put("diamond", Material.DIAMOND);
 
-        // Emerald (base = item = 1; block deposits as 9)
-        reg(Material.EMERALD_BLOCK, "emerald", 9.0);
-        reg(Material.EMERALD,       "emerald", 1.0);
-        DEF_OUT.put("emerald", Material.EMERALD);
+        // Emerald (base = block = 1; item deposits as 1/9)
+        reg(Material.EMERALD_BLOCK, "emerald", 1.0);
+        reg(Material.EMERALD,       "emerald", 1.0 / 9);
+        DEF_OUT.put("emerald", Material.EMERALD_BLOCK);
 
         // Redstone (base = dust = 1; block deposits as 9)
         reg(Material.REDSTONE_BLOCK, "redstone", 9.0);
@@ -254,14 +254,18 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         reg(Material.DIRT,         "dirt",        1.0); DEF_OUT.put("dirt",        Material.DIRT);
 
         // ── Aliases (shorthand → canonical Material) ──────────────────────────
-        ALIASES.put("coal",            Material.COAL);
-        ALIASES.put("iron",            Material.IRON_INGOT);
+        ALIASES.put("coal",            Material.COAL_BLOCK);
+        ALIASES.put("coal_block",      Material.COAL_BLOCK);
+        ALIASES.put("iron",            Material.IRON_BLOCK);
+        ALIASES.put("iron_block",      Material.IRON_BLOCK);
         ALIASES.put("iron_ingot",      Material.IRON_INGOT);
-        ALIASES.put("gold",            Material.GOLD_INGOT);
+        ALIASES.put("gold",            Material.GOLD_BLOCK);
+        ALIASES.put("gold_block",      Material.GOLD_BLOCK);
         ALIASES.put("gold_ingot",      Material.GOLD_INGOT);
         ALIASES.put("copper",          Material.COPPER_INGOT);
         ALIASES.put("copper_ingot",    Material.COPPER_INGOT);
-        ALIASES.put("emerald",         Material.EMERALD);
+        ALIASES.put("emerald",         Material.EMERALD_BLOCK);
+        ALIASES.put("emerald_block",   Material.EMERALD_BLOCK);
         ALIASES.put("lapis",           Material.LAPIS_LAZULI);
         ALIASES.put("lapis_lazuli",    Material.LAPIS_LAZULI);
         ALIASES.put("netherite",       Material.NETHERITE_INGOT);
@@ -299,6 +303,9 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getScheduler().runTaskTimer(this, this::reportAlivePlayers, 20L * 60L, 20L * 60L);
         getLogger().info("MDragonsEconomy loaded. Backend: " + BACKEND_URL + (API_KEY.isEmpty() ? " (no API key)" : " (API key configured)"));
+        if (API_KEY.isEmpty()) {
+            getLogger().severe("API_KEY is not set. Backend requests will be rejected by a secured backend.");
+        }
     }
 
     @EventHandler
@@ -406,16 +413,15 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
                 return true;
             }
             case "alive" -> {
-                int page = 1;
-                if (args.length >= 1) {
-                    try {
-                        page = Math.max(1, Integer.parseInt(args[0]));
-                    } catch (NumberFormatException e) {
-                        player.sendMessage("§cPage must be a positive number.");
-                        return true;
-                    }
-                }
+                Integer page = parsePageArg(player, args);
+                if (page == null) return true;
                 handleAliveLeaderboard(player, page);
+                return true;
+            }
+            case "bounties" -> {
+                Integer page = parsePageArg(player, args);
+                if (page == null) return true;
+                handleBounties(player, page);
                 return true;
             }
             case "bounty", "bouny" -> {
@@ -870,15 +876,35 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         return Material.PAPER;
     }
 
+    private Integer parsePageArg(Player player, String[] args) {
+        if (args.length < 1) return 1;
+        try {
+            return Math.max(1, Integer.parseInt(args[0]));
+        } catch (NumberFormatException e) {
+            player.sendMessage("§cPage must be a positive number.");
+            return null;
+        }
+    }
+
     private void handleAliveLeaderboard(Player player, int page) {
+        handleTextPage(player, page, "§7Fetching alive leaderboard...",
+                "§6§lAlive Leaderboard", "§7No alive streaks yet.", "/alive/leaderboard_text");
+    }
+
+    private void handleBounties(Player player, int page) {
+        handleTextPage(player, page, "§7Fetching active bounties...",
+                "§6§lActive Bounties", "§7No active bounties.", "/bounties_text");
+    }
+
+    private void handleTextPage(Player player, int page, String loadingMessage, String title, String emptyMessage, String endpoint) {
         int offset = (page - 1) * 10;
-        player.sendMessage("§7Fetching alive leaderboard...");
+        player.sendMessage(loadingMessage);
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
-            String text = httpGet(BACKEND_URL + "/alive/leaderboard_text?limit=10&offset=" + offset);
+            String text = httpGet(BACKEND_URL + endpoint + "?limit=10&offset=" + offset);
             getServer().getScheduler().runTask(this, () -> {
-                player.sendMessage("§6§lAlive Leaderboard §7(Page " + page + ")");
+                player.sendMessage(title + " §7(Page " + page + ")");
                 if (text == null || text.isBlank()) {
-                    player.sendMessage("§7No alive streaks yet.");
+                    player.sendMessage(emptyMessage);
                     return;
                 }
                 for (String line : text.split("\\n")) {
@@ -949,12 +975,12 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
             switch (cat) {
                 case "ores" -> {
                     player.sendMessage("§6§lOres §7— deposit/withdraw by item or block:");
-                    player.sendMessage("  §fcoal§7 → coal, coal_block");
-                    player.sendMessage("  §firon§7 → iron_ingot §8(base), iron_block §8(9 ingots)");
-                    player.sendMessage("  §fgold§7 → gold_ingot §8(base), gold_block §8(9 ingots), gold_nugget §8(1/9)");
+                    player.sendMessage("  §fcoal§7 → coal_block §8(base), coal §8(1/9)");
+                    player.sendMessage("  §firon§7 → iron_block §8(base), iron_ingot §8(1/9)");
+                    player.sendMessage("  §fgold§7 → gold_block §8(base), gold_ingot §8(1/9), gold_nugget §8(1/81)");
                     player.sendMessage("  §fcopper§7 → copper_ingot §8(base), copper_block §8(9 ingots)");
                     player.sendMessage("  §fdiamond§7 → diamond, diamond_block  §8(order-book item)");
-                    player.sendMessage("  §femerald§7 → emerald §8(base), emerald_block §8(9 emeralds)");
+                    player.sendMessage("  §femerald§7 → emerald_block §8(base), emerald §8(1/9)");
                     player.sendMessage("  §fredstone§7 → redstone §8(base), redstone_block §8(9 dust)");
                     player.sendMessage("  §flapis§7 → lapis_lazuli §8(base), lapis_block §8(9 lapis)");
                     player.sendMessage("  §fnetherite§7 → netherite_ingot, netherite_scrap §8(4 scraps = 1 ingot)");
@@ -1036,7 +1062,7 @@ public class MDragonsEconomy extends JavaPlugin implements Listener {
         player.sendMessage("  §fcolor     §8— wool, concrete, concrete_powder, dyes");
         player.sendMessage("  §fmisc      §8— xp, feather, ink_sac, glow_ink_sac");
         player.sendMessage("§7Example: §f/helpmc wood  §7or §f/helpmc color");
-        player.sendMessage("§8Tip: /balance <item> opens an item GUI; /alive shows survival streaks");
+        player.sendMessage("§8Tip: /balance <item> opens an item GUI; /alive shows survival streaks; /bounties shows targets");
         player.sendMessage("§8Tip: /deposit <item> all, /deposit inv, and /deposit xp all are supported");
         player.sendMessage("§6§l════════════════════════");
     }

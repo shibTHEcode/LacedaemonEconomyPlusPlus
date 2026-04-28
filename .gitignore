@@ -1,0 +1,47 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# SQLite data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+/data/
+/backups/
+/*.db
+/*.sqlite
+/*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+
+# Java / Minecraft builds
+*.class
+*.jar
+target/
+build/
+.gradle/
+out/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
